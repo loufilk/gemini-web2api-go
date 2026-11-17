@@ -1,6 +1,6 @@
 # gemini-web2api-go
 
-**Gemini web → OpenAI-compatible API.** A self-hosted proxy that turns the free [gemini.google.com](https://gemini.google.com) web app into `/v1/chat/completions` — **no Google API key, no paid quota**. Single Go binary, real Chrome TLS fingerprint, cookie pool with automatic renewal, proxy pool, built-in admin dashboard, SQLite / MySQL / PostgreSQL. Image, music, canvas and video generation (`/v1/videos`) included. Models track the web app, **Gemini 4 Argon** included (needs a paid-account cookie).
+**Gemini web → OpenAI-compatible API.** A self-hosted proxy that turns the free [gemini.google.com](https://gemini.google.com) web app into `/v1/chat/completions` — **no Google API key, no paid quota**. Single Go binary, real Chrome TLS fingerprint, cookie pool with automatic renewal, proxy pool, built-in admin dashboard, SQLite / MySQL / PostgreSQL. Image, music, canvas and video generation (`/v1/videos`) included. Models track the web app, **Gemini 4 Hydrogen and Carbon** routes verify the model reported by the web backend; availability depends on account access.
 
 <img src="docs/banner.svg" alt="gemini-web2api-go — Gemini web to OpenAI-compatible API, native Gemini API and MCP" width="100%">
 
@@ -91,7 +91,7 @@
 **模型**
 - `gemini-3.6-flash`、`gemini-3.5-flash-lite` 匿名可用，含联网搜索
 - `gemini-3.1-pro` 挂 cookie 后可用，每次回答带思考链（`reasoning_content`）
-- `gemini-3.8-flash`、`gemini-4-argon` 要付费 / Ultra 账号的 cookie
+- `gemini-3.8-flash`、`gemini-4-hydrogen`、`gemini-4-argon` 要付费 / Ultra 账号的 cookie，且账号在网页端有相应模型权限
 - 各模型都有 `-thinking` 版（扩展思考），挂 cookie 后可用
 - 响应里记录服务端**实际**用了哪个模型，被静默降级一眼可见
 
@@ -332,26 +332,31 @@ Claude Code / Cursor 这类 MCP 客户端直接调用。
 
 ## 模型
 
-模型跟着 Gemini 网页端的模型选择器走（清单来自 `batchexecute?rpcids=otAQ7b`）：基础模型 5 个，
-3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 免费号就能用，3.8 Flash / 4 Argon 要付费号；其余是它们的思考档和媒体工具。
+模型跟着 Gemini 网页端的模型选择器走（清单来自 `batchexecute?rpcids=otAQ7b`）：
+Hydrogen 和 Carbon 是需要相应网页端权限的模型路由；有登录态不代表已开通。旧 3.7/3.8 Flash 名称仍可调用，但统一进入 Hydrogen 并返回对应正名。
 
 | 模型 | 描述 |
 |---|---|
 | `gemini-3.6-flash` | 全方位，默认 |
 | `gemini-3.5-flash-lite` | 极速、轻量 |
 | `gemini-3.1-pro` | 最强，**要配 cookie**；每次回答都带思考链 |
-| `gemini-3.8-flash` | 新款 Flash，**要付费 Gemini 账号的 cookie**（免费号降级成 3.5 Flash-Lite）。`gemini-3.7-flash` 是它的别名——Google 把 3.7 那个 hex 原地升成了 3.8 |
-| `gemini-4-argon` | 4 Argon（复杂任务），**要付费/Ultra Gemini 账号的 cookie**（免费号降级成 3.5 Flash-Lite）|
+| `gemini-3.8-flash` | 兼容别名，指向 `gemini-4-hydrogen`；不在模型列表中展示 |
+| `gemini-4-hydrogen` | 4 Hydrogen 普通档，**要付费 Gemini 账号的 cookie，且账号在网页端可用 Hydrogen** |
+| `gemini-4-carbon` | 独立候选路由，只有上游自报 4 Carbon 才成功 |
 | `gemini-3.6-flash-thinking` | 3.6 Flash 开扩展思考，**要配 cookie** |
 | `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite 开扩展思考，**要配 cookie** |
 | `gemini-3.1-pro-thinking` | 3.1 Pro 开扩展思考，**要配 cookie** |
-| `gemini-3.8-flash-thinking` | 3.8 Flash 开扩展思考，**要付费号 cookie**（`gemini-3.7-flash-thinking` 为别名）|
-| `gemini-4-argon-thinking` | 4 Argon 开扩展思考（上游叫 High 档），带 `reasoning_content`，**要付费/Ultra 号 cookie** |
-| `gemini-4-argon-thinking-medium` | 4 Argon 的中等思考档（上游 Medium，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
+| `gemini-3.8-flash-thinking` | 兼容别名，指向 `gemini-4-hydrogen-thinking` |
+| `gemini-4-hydrogen-thinking` | 请求扩展思考；校验 Hydrogen 系列，不证明实际思考档 |
+
 | `gemini-image` | 生图（Nano Banana），产物 base64，**要配 cookie** |
 | `gemini-music` | 音乐（Lyria，约 30 秒），产物 base64，**要配 cookie** |
 | `gemini-canvas` | 画布，生成交互 HTML 文档（内联返回 ```html 块），**要配 cookie** |
 | `gemini-video` | 生视频（异步，几十秒~几分钟），产物 base64 MP4，**要 Pro/付费号**；免费号被上游内容政策拒 |
+
+这三条 4 系列路由不受 `strict_model` 开关影响。型号缺失或不符返回 502（`model_identity_unverified` 或 `model_identity_mismatch`），不会换号重放。流式请求等上游完成并核对后才发 SSE；其他模型保留原流式行为。Argon 不在模型列表中，直接调用只接受真实的 Argon 回报，绝不把 Carbon 当 Argon。
+
+> Hydrogen 路由依据：[上游 issue #74](https://github.com/zexadev/gemini-web2api-go/issues/74) 与 [gemini-stealth-bridge 的模型注册测试](https://github.com/azrinaldi/gemini-stealth-bridge/blob/ace32031a4ba9576d9f1d913c996e03d9bb6d087/internal/gemini/registry_names_test.go#L35)。这是社区网页协议证据，尚未在本机使用真实账号验证。
 
 没配 cookie 时 `/v1/models` 只返回前两个，选 `gemini-3.1-pro` 会直接报错并说明
 原因。因为匿名请求它必然被静默降级成 3.5 Flash-Lite——与其让客户端拿到一个
@@ -804,7 +809,7 @@ Docker 用默认 bridge 网络时上游可能返回空内容（Google 拒绝某�
 
 匿名（不挂 cookie）：`gemini-3.6-flash`、`gemini-3.5-flash-lite`，含联网搜索。
 挂免费账号 cookie：额外解锁 `gemini-3.1-pro`、3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 的思考版（`-thinking`）、读图 / 读视频、生图、音乐、画布。
-付费账号才有：`gemini-3.8-flash`、`gemini-4-argon`（及其 `-thinking`，免费号都会被降级成 3.5 Flash-Lite）和生视频（`gemini-video` / `/v1/videos`）。
+付费账号路由：`gemini-3.8-flash`、`gemini-4-hydrogen`、`gemini-4-argon`（及其 `-thinking`）和生视频（`gemini-video` / `/v1/videos`）。Hydrogen 还要求该账号在网页端可用该模型；添加 cookie 本身不保证已开通权限。
 
 ### 为什么每发一条消息，gemini.google.com 里就多出一个会话？
 
@@ -818,19 +823,9 @@ Docker 用默认 bridge 网络时上游可能返回空内容（Google 拒绝某�
 agent 工具一次塞几万字系统提示和历史时容易答非所问、看起来变笨——这是网页端模型的先天限制，不是接入方式的问题。
 Function calling 是 prompt 级实现，模型不一定每次都按格式返回。
 
-### 有 gemini-3.8-flash 吗？
+### 旧 3.8 Flash、Hydrogen、Argon 和 Carbon 怎么选？
 
-有（`gemini-3.8-flash` 与 `gemini-3.8-flash-thinking`），需要付费 Gemini 账号；免费号请求它会被服务端降级成 3.5 Flash-Lite。
-`gemini-3.7-flash` 作为别名保留，老客户端不受影响。
-
-### 能用 Gemini 4 Argon 吗？怎么用？
-
-能，不需要 Gemini API key。模型名 `gemini-4-argon`；`gemini-4-argon-thinking` 是上游的 High 思考档，回复带 `reasoning_content`；
-中档是 `gemini-4-argon-thinking-medium`（见模型表）。
-条件只有一个：挂进来的 cookie 所属账号在 gemini.google.com 的模型选择器里能看到「4 Argon」。看得到就是有权限
-（Google AI Pro / Ultra 档，捆绑或学生优惠拿到的 Pro 一样算），把它的 cookie 配进管理面板、请求 `gemini-4-argon` 即可。
-免费号或没开 Argon 的号发它，上游会**静默降级成 3.5 Flash-Lite**、不报错，所以本项目没配 cookie 时不暴露这个模型，也不走匿名。
-配了 cookie 仍被降级，先去网页端确认该账号有没有「4 Argon」；浏览器里登了多个号的，再确认 Cookie 池里这条的「账号序号」填对了。
+旧 `gemini-3.7-flash` / `gemini-3.8-flash`（含 thinking）是 Hydrogen 的兼容别名；可以继续填写旧名，响应使用 Hydrogen 正名。若会员路由未切换、没有自报、或返回另一个型号，生成失败而不是改贴标签。Carbon 和 Argon 分别验身份，后者不在默认目录。网页权限和实际思考档应单独验收。
 
 ### 生图用的是哪个模型？能出 2K 吗？
 

@@ -338,6 +338,10 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 		"%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
 		geminiBase(conv.authuser), currentBL(proxyURL), reqid)
 
+	// Do not emit possibly mislabelled output before the complete identity check.
+	if mc.RequireModelIdentity {
+		onDelta, onReasoning = nil, nil
+	}
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
 	strictCheck := strictLineCheck(mc, func() int64 { return conv.accountID })
@@ -426,6 +430,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
+		}
+		if reported, identityErr := verifyModelIdentity(mc, string(raw)); identityErr != nil {
+			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, UpstreamModel: reported, TotalMs: time.Since(t0).Milliseconds()}, identityErr
 		}
 		// 成功：回填续接状态。
 		cid, rid, rcid, tok26 := parseConvIDs(string(raw))

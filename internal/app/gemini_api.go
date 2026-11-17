@@ -279,6 +279,8 @@ func writeGeminiError(w http.ResponseWriter, code int, msg string) {
 // writeGeminiCallError 跟 OpenAI 那两条路同一套分流：降级 429、超长 400、限流 429、其余 502。
 func writeGeminiCallError(w http.ResponseWriter, err error) {
 	switch e := err.(type) {
+	case *ModelIdentityError:
+		writeGeminiError(w, http.StatusBadGateway, e.Error())
 	case *ModelDowngradedError:
 		if e.RetryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(e.RetryAfter.Seconds()))))
@@ -672,7 +674,10 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 	if includeThoughts {
 		onReasoning = st.thought
 	}
-	ka := startKeepalive(st.ping)
+	var ka *streamKeepalive
+	if !g.modelCfg.RequireModelIdentity {
+		ka = startKeepalive(st.ping)
+	}
 	onDelta, onReasoning = ka.guard(onDelta), ka.guard(onReasoning)
 
 	text, calls, res, err := runGeminiCall(g, onDelta, onReasoning)

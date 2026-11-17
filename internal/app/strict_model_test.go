@@ -19,10 +19,10 @@ func setStrictModel(t *testing.T, on bool) {
 const downgradedLine = `[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"1+1等于2。\"]]],null,\"cf41b0e0dd7d53e5\",null,null,\"3.5 Flash-Lite\",true]"]]`
 
 func TestStrictLineCheck(t *testing.T) {
-	argon := Models["gemini-4-argon"]
+	model := Models["gemini-3.1-pro"]
 
 	setStrictModel(t, false)
-	if strictLineCheck(argon, func() int64 { return 7 }) != nil {
+	if strictLineCheck(model, func() int64 { return 7 }) != nil {
 		t.Fatal("开关关着应返回 nil，不能给读取路径加任何开销")
 	}
 
@@ -30,7 +30,7 @@ func TestStrictLineCheck(t *testing.T) {
 	if strictLineCheck(Models["gemini-image"], func() int64 { return 7 }) != nil {
 		t.Fatal("媒体模型没登记 Upstream，不该检查")
 	}
-	check := strictLineCheck(argon, func() int64 { return 7 })
+	check := strictLineCheck(model, func() int64 { return 7 })
 	err := check(downgradedLine)
 	var mde *ModelDowngradedError
 	if !errors.As(err, &mde) || mde.Reported != "3.5 Flash-Lite" || mde.AccountID != 7 {
@@ -151,7 +151,21 @@ func TestModelDowngraded(t *testing.T) {
 		{"gemini-3.1-pro-thinking", "3.1 Pro High", false},
 		{"gemini-3.6-flash-thinking", "3.6 Flash 扩展", false},
 		{"gemini-4-argon-thinking", "4 Argon High", false},
-		{"gemini-3.7-flash", "3.8 Flash", false},
+		{"gemini-3.7-flash", "3.8 Flash", true},
+		{"gemini-4-hydrogen", "4 Hydrogen", false},
+		{"gemini-4-hydrogen-thinking", "4 Hydrogen High", false},
+		{"gemini-4-hydrogen-thinking", "4 Hydrogen Thinking High", false},
+		// The old Flash names must accept the upstream rename without disabling strict_model.
+		{"gemini-3.8-flash", "4 Hydrogen", false},
+		{"gemini-3.7-flash", "4 Hydrogen", false},
+		{"gemini-3.8-flash-thinking", "4 Hydrogen High", false},
+		{"gemini-3.7-flash-thinking", "4 Hydrogen High", false},
+		{"gemini-3.8-flash-thinking", "3.8 Flash High", true},
+		// An explicit Hydrogen request must still reject older models and other tiers.
+		{"gemini-4-hydrogen", "3.8 Flash", true},
+		{"gemini-4-hydrogen", "3.5 Flash-Lite", true},
+		{"gemini-4-hydrogen-thinking", "4 Argon High", true},
+		{"gemini-4-hydrogen", "4 Hydrogenium", true},
 		// 2026-10-24 实测：无 Argon 权限的号请求 Argon，自报 3.5 Flash-Lite
 		{"gemini-4-argon", "3.5 Flash-Lite", true},
 		// 同日实测：免费号请求 3.8，自报 3.6 Flash

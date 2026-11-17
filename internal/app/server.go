@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Version = "4.28.1"
+const Version = "4.28.1-chuanapi.1"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -222,6 +222,17 @@ func recordRequest(endpoint, model, prompt, response string, res *StreamResult, 
 	go insertRequest(r)
 }
 
+// runOpenAIModel shares the same model selection across Chat and Responses.
+var runOpenAIModel = func(messages []map[string]interface{}, prompt, latest string, mc ModelConfig,
+	tools []map[string]interface{}, toolChoice interface{}, images []pendingUpload,
+	onDelta, onReasoning func(string),
+) (string, []ToolCall, *StreamResult, error) {
+	if rtCfg().MultiTurn && len(images) == 0 && mc.Tool == 0 {
+		return callGeminiConv(messages, mc, tools, toolChoice, onDelta, onReasoning)
+	}
+	return callGemini(prompt, latest, mc, tools, images, onDelta, onReasoning)
+}
+
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -305,19 +316,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			gate = newToolFenceGate(sse.SendContent)
 			onDelta = gate.Push
 		}
-		ka = startKeepalive(sse.Ping)
+		if !modelCfg.RequireModelIdentity {
+			ka = startKeepalive(sse.Ping)
+		}
 		onDelta, onReasoning = ka.guard(onDelta), ka.guard(onReasoning)
 	}
 
-	var text string
-	var toolCalls []ToolCall
-	var res *StreamResult
-	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
-		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
-		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
-	} else {
-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
-	}
+	text, toolCalls, res, err := runOpenAIModel(messages, prompt, latest, modelCfg, tools, req["tool_choice"], images, onDelta, onReasoning)
 	ka.Stop() // 之后的收尾回到单 goroutine 写；Started() 也要在保活停下后再看
 	if err != nil {
 		mde, downgraded := err.(*ModelDowngradedError)
@@ -328,6 +333,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordRequest("chat.completions", modelName, prompt, "", res, status, err.Error(), stream)
 		if sse != nil && sse.Started() {
 			sse.Fail(err) // 已经开流，HTTP 状态码改不了了
+			return
+		}
+		if identityErr, ok := err.(*ModelIdentityError); ok {
+			writeModelIdentityError(w, identityErr)
 			return
 		}
 		if downgraded {
@@ -607,16 +616,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	// 代价是一旦开了流 HTTP 状态码就改不了了，上游失败只能用 response.failed
 	// 事件告知 —— 跟 /v1/chat/completions 那条路的取舍一致。
 	var writeEvent func(string, interface{})
+	var startResponse func()
 	var emitDelta func(string)
 	var gate *toolFenceGate
 	var onDelta func(string)
 	var ka *streamKeepalive
 	if stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no") // 关掉反代对 SSE 的缓冲，见 sse.go
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.WriteHeader(200)
 		flusher, _ := w.(http.Flusher)
 		writeEvent = func(eventType string, payload interface{}) {
 			pj, _ := json.Marshal(payload)
@@ -625,16 +630,26 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 		}
-		writeEvent("response.created", map[string]interface{}{
-			"type": "response.created",
-			"response": map[string]interface{}{
-				"id":     rid,
-				"object": "response",
-				"status": "in_progress",
-				"model":  modelName,
-				"output": []interface{}{},
-			},
-		})
+		startResponse = func() {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Accel-Buffering", "no") // 关掉反代对 SSE 的缓冲，见 sse.go
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.WriteHeader(200)
+			writeEvent("response.created", map[string]interface{}{
+				"type": "response.created",
+				"response": map[string]interface{}{
+					"id":     rid,
+					"object": "response",
+					"status": "in_progress",
+					"model":  modelName,
+					"output": []interface{}{},
+				},
+			})
+		}
+		if !modelCfg.RequireModelIdentity {
+			startResponse()
+		}
 		ensureMsg = func() {
 			if msgIndex >= 0 {
 				return
@@ -673,25 +688,20 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			onDelta = gate.Push
 		}
 		// 这条路响应头一开始就发了，保活没有锁状态码的代价。
-		ka = startKeepalive(func() {
-			fmt.Fprint(w, ": ping\n\n")
-			if flusher != nil {
-				flusher.Flush()
-			}
-		})
+		if !modelCfg.RequireModelIdentity {
+			ka = startKeepalive(func() {
+				fmt.Fprint(w, ": ping\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+			})
+		}
 		onDelta = ka.guard(onDelta)
 	}
 
 	// onReasoning 传 nil：Responses API 有自己的 reasoning 事件形状，跟 chat 的
 	// reasoning_content 不通用，这条路目前不暴露思考链。
-	var text string
-	var toolCalls []ToolCall
-	var res *StreamResult
-	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
-		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
-	} else {
-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
-	}
+	text, toolCalls, res, err := runOpenAIModel(messages, prompt, latest, modelCfg, tools, req["tool_choice"], images, onDelta, nil)
 	ka.Stop()
 	if err != nil {
 		mde, downgraded := err.(*ModelDowngradedError)
@@ -700,7 +710,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			status = 429
 		}
 		recordRequest("responses", modelName, prompt, "", res, status, err.Error(), stream)
-		if stream {
+		if stream && !modelCfg.RequireModelIdentity {
 			errObj := map[string]string{"message": err.Error()}
 			if downgraded {
 				errObj["code"] = "model_downgraded"
@@ -715,6 +725,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 					"error":  errObj,
 				},
 			})
+			return
+		}
+		if identityErr, ok := err.(*ModelIdentityError); ok {
+			writeModelIdentityError(w, identityErr)
 			return
 		}
 		if downgraded {
@@ -741,6 +755,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if stream && modelCfg.RequireModelIdentity {
+		startResponse()
+	}
 	var output []map[string]interface{}
 	for _, tc := range toolCalls {
 		output = append(output, map[string]interface{}{

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -134,7 +135,7 @@ func writeModelDowngraded(w http.ResponseWriter, e *ModelDowngradedError) {
 // 每行先过它再转发正文：显示名跟第一段正文在同一行或更早出现（2026-10-24 实测
 // 逐行看过），所以先查再发就能在第一个字出去之前掐断。
 func strictLineCheck(mc ModelConfig, accountID func() int64) func(line string) error {
-	if !rtCfg().StrictModel || mc.Upstream == "" {
+	if mc.RequireModelIdentity || !rtCfg().StrictModel || mc.Upstream == "" {
 		return nil
 	}
 	return func(line string) error {
@@ -161,11 +162,108 @@ func foldModelName(s string) string {
 //
 // 看不见就不判：没自报（reported 为空）或模型没登记 Upstream 一律当没降级——
 // 误报会让开了开关的人白白丢请求，比漏判更伤。
+// 已确认的原地改名可由 UpstreamAliases 放行（旧 Flash → Hydrogen）；显式 Hydrogen
+// 条目没有旧名别名，因此返回 3.8 Flash 时仍会报降级。
 func modelDowngraded(mc ModelConfig, reported string) bool {
 	want := foldModelName(mc.Upstream)
 	got := foldModelName(reported)
 	if want == "" || got == "" {
 		return false
 	}
-	return got != want && !strings.HasPrefix(got, want+" ")
+	if got == want || strings.HasPrefix(got, want+" ") {
+		return false
+	}
+	for _, alias := range mc.UpstreamAliases {
+		if name := foldModelName(alias); name != "" && (got == name || strings.HasPrefix(got, name+" ")) {
+			return false
+		}
+	}
+	return true
+}
+
+// ModelIdentityError distinguishes slot drift/unknown identity from known quota downgrades.
+type ModelIdentityError struct {
+	Requested string
+	Reported  string
+}
+
+func (e *ModelIdentityError) Error() string {
+	if e.Reported == "" {
+		return fmt.Sprintf("cannot verify requested %s: upstream did not report a model identity", e.Requested)
+	}
+	return fmt.Sprintf("requested %s but upstream reported %s; no output returned", e.Requested, e.Reported)
+}
+
+func (e *ModelIdentityError) code() string {
+	if e.Reported == "" {
+		return "model_identity_unverified"
+	}
+	return "model_identity_mismatch"
+}
+
+var identityHex = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// Parse only top-level fields in a Gemini response frame, never text inside a
+// candidate. StreamGenerate and WebChannel both expose these wrapped frames.
+func responseModelReports(raw string) []string {
+	var reports []string
+	for _, line := range strings.Split(raw, "\n") {
+		if !strings.Contains(line, `"wrb.fr"`) {
+			continue
+		}
+		var frames [][]json.RawMessage
+		if json.Unmarshal([]byte(line), &frames) != nil {
+			continue
+		}
+		for _, frame := range frames {
+			if len(frame) < 3 || string(frame[0]) != `"wrb.fr"` {
+				continue
+			}
+			var embedded string
+			var fields []json.RawMessage
+			if json.Unmarshal(frame[2], &embedded) != nil || json.Unmarshal([]byte(embedded), &fields) != nil {
+				continue
+			}
+			for i := 5; i+3 < len(fields); i++ {
+				if string(fields[i+1]) != "null" || string(fields[i+2]) != "null" {
+					continue
+				}
+				var hex, name string
+				if json.Unmarshal(fields[i], &hex) == nil && identityHex.MatchString(hex) &&
+					json.Unmarshal(fields[i+3], &name) == nil && strings.TrimSpace(name) != "" {
+					reports = append(reports, name)
+				}
+			}
+		}
+	}
+	return reports
+}
+
+// An explicit family check does not claim a verified thinking tier.
+func verifyModelIdentity(mc ModelConfig, raw string) (string, error) {
+	if !mc.RequireModelIdentity {
+		return "", nil
+	}
+	want := strings.ToLower(mc.Upstream)
+	var reported string
+	for _, name := range responseModelReports(raw) {
+		reported = name
+		got := strings.Join(strings.Fields(strings.ToLower(reported)), " ")
+		switch got {
+		case want, want + " low", want + " medium", want + " high",
+			want + " thinking", want + " thinking high", want + " extended", want + " 扩展":
+		default:
+			return reported, &ModelIdentityError{Requested: mc.Upstream, Reported: reported}
+		}
+	}
+	if reported == "" {
+		return "", &ModelIdentityError{Requested: mc.Upstream}
+	}
+	return reported, nil
+}
+
+func writeModelIdentityError(w http.ResponseWriter, e *ModelIdentityError) {
+	writeJSON(w, http.StatusBadGateway, map[string]interface{}{"error": map[string]string{
+		"message": e.Error(), "type": "upstream_error", "code": e.code(),
+	}})
 }

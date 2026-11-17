@@ -31,6 +31,11 @@ const (
 	// "当前 Flash" 泛指针，老批次号发它拿到的是 3.6，会冒充 3.7。老批次号发这个主 hex
 	// 会干净降级成 3.5 Flash-Lite（跟 3.1 Pro 一样），所以 gate 成要 cookie。
 	hexFlash38 = "56fdd199312815e2" // 3.8 Flash（原记 3.7；Google 把这个 hex 原地升成 3.8，HAR 响应帧显示名已是 "3.8 Flash"）
+	// 4 Hydrogen：付费号的 3.8 Flash 路由被原地升级，仍用同一个 hex + Mode=1。
+	// 来源：上游 issue #74 及公开 otAQ7b 清单样本（2026-11-13）：
+	// https://github.com/azrinaldi/gemini-stealth-bridge/blob/ace32031a4ba9576d9f1d913c996e03d9bb6d087/internal/gemini/registry_names_test.go
+	// 账号清单可能不同；这里只复用已有的付费路由，不把匿名 Flash 冒充 Hydrogen。
+	hexHydrogen4 = hexFlash38
 	// 4 Argon（#35）：otAQ7b 清单里主 hex 95a4c0abcba24364、短名 Argon、代号 Argon4p0、
 	// 显示名 "4 Argon"。付费/Ultra 号专属。实测**真正选中它靠的是 MODE=8（header 下标 14 /
 	// inner[79]），不是 hex**：借来的 Ultra 号上，hex=Argon 配 mode=1 回报 "3.8 Flash"（mode 1
@@ -85,6 +90,13 @@ type ModelConfig struct {
 	// "Nano Banana 2" 这类后端名）。只能用显示名：跟它并排的 hex 现在不管实际用了
 	// 哪个模型都回 Flash-Lite 的那个。
 	Upstream string
+	// RequireModelIdentity gates success on explicit response metadata, independent of strict_model.
+	RequireModelIdentity bool
+	// HiddenFromCatalog preserves direct IDs without advertising retired/ambiguous routes.
+	HiddenFromCatalog bool
+	// UpstreamAliases 仅用于已确认的上游改名：旧客户端名仍接受原显示名和新显示名。
+	// 显式请求新模型时不接受旧显示名，避免把尚未升级的账号当成新模型。
+	UpstreamAliases []string
 	// VideoAspect is the inner[55] aspect code for video: 16 = 16:9 (default), 17 = 9:16.
 	VideoAspect int
 	// PinAccountID forces the request onto one cookie-pool account (no fallback to
@@ -125,26 +137,32 @@ var Models = map[string]ModelConfig{
 	// 3.8 Flash：Google 把原 3.7 那个 hex 原地升级了（同 hex，服务端显示名从 3.7 变 3.8）。
 	// 实测是**付费号专属**（不是灰度）：只有付费 Gemini 账号有，免费号降级成 3.5 Flash-Lite。
 	// gemini-3.7-flash 保留为别名（同 hex）。
-	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "3.8 Flash; needs a signed-in PAID Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
-	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash (same hex; Google renamed 3.7→3.8)"},
+	"gemini-3.8-flash":  {HexID: hexFlash38, Mode: 1, Upstream: "4 Hydrogen", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "Legacy Flash route, now 4 Hydrogen on upgraded accounts; needs a signed-in PAID Google account"},
+	"gemini-3.7-flash":  {HexID: hexFlash38, Mode: 1, Upstream: "4 Hydrogen", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "alias of gemini-3.8-flash (same route, now 4 Hydrogen on upgraded accounts)"},
+	"gemini-4-hydrogen": {HexID: hexHydrogen4, Mode: 1, Upstream: "4 Hydrogen", RequireModelIdentity: true, Desc: "4 Hydrogen via the upgraded paid Flash route; needs a signed-in cookie from an account with Hydrogen access"},
 	// 4 Argon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
 	// 免费号发它会被静默降级成 3.5 Flash-Lite，所以 gate 成要 cookie（modelNeedsLogin）。
-	"gemini-4-argon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Argon", Desc: "4 Argon (complex tasks); needs a signed-in PAID/Ultra Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
+	"gemini-4-argon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Argon", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "4 Argon (complex tasks); needs a signed-in PAID/Ultra Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
+
+	// The observed Ultra slot now returns Carbon; never accept it as Argon.
+	"gemini-4-carbon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Carbon", RequireModelIdentity: true, Desc: "4 Carbon on the upgraded paid slot; upstream identity must be confirmed"},
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
 	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Upstream: "3.6 Flash", Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
 	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Upstream: "3.5 Flash-Lite", Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
 	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
-	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
-	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash-thinking"},
+	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "Legacy Flash route with extended thinking, now 4 Hydrogen on upgraded accounts; needs a signed-in PAID account"},
+	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "alias of gemini-3.8-flash-thinking"},
+	// 同一付费路由的扩展思考（think=2），不是其他账号清单里独立的 Mode=5 Thinking 模型。
+	"gemini-4-hydrogen-thinking": {HexID: hexHydrogen4, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", RequireModelIdentity: true, Desc: "4 Hydrogen with extended thinking via the upgraded paid Flash route; needs a signed-in cookie from an account with Hydrogen access"},
 	// 4 Argon + 扩展思考：Mode=8（选 Argon）+ inner[80]=2（上游现在把这档叫 "High"）。
 	// 实测回报 "4 Argon High" 且带思考链（硬题 985 字符，走既有 [4][0][37][0][0] 路径，
 	// 无需改抽取代码）→ 映射成 reasoning_content。付费/Ultra 专属。
-	"gemini-4-argon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Argon", Desc: "4 Argon with extended thinking (High reasoning tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
+	"gemini-4-argon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Argon", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "4 Argon with extended thinking (High reasoning tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
 	// 中档：think 线值 4（高档是 2）。中档思考在服务端内部完成、不吐思考链，所以不设
 	// Thinking（不期望 reasoning_content），登录门控靠 hexArgon4 + thinkWire。
-	"gemini-4-argon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Argon", Desc: "4 Argon at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
+	"gemini-4-argon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Argon", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "4 Argon at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
 
 	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
 	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
@@ -201,12 +219,10 @@ func temporaryChatEligible() bool {
 // 登录也只能拿到 3.6 Flash 扩展」是在缺 XSRF token 的条件下测的，那时候带
 // cookie 的请求根本发不出去（见 xsrf.go）。
 func availableModels() map[string]ModelConfig {
-	if hasCookie() {
-		return Models
-	}
+	signedIn := hasCookie()
 	out := make(map[string]ModelConfig, len(Models))
 	for k, v := range Models {
-		if modelNeedsLogin(v) {
+		if v.HiddenFromCatalog || (!signedIn && modelNeedsLogin(v)) {
 			continue
 		}
 		out[k] = v
@@ -224,8 +240,14 @@ func resolveModel(modelName string) (string, ModelConfig, error) {
 	if idx := strings.Index(modelName, "@think="); idx >= 0 {
 		modelName = modelName[:idx]
 	}
-	mc, ok := availableModels()[modelName]
-	if !ok {
+	switch modelName {
+	case "gemini-3.7-flash", "gemini-3.8-flash":
+		modelName = "gemini-4-hydrogen"
+	case "gemini-3.7-flash-thinking", "gemini-3.8-flash-thinking":
+		modelName = "gemini-4-hydrogen-thinking"
+	}
+	mc, ok := Models[modelName]
+	if !ok || (modelNeedsLogin(mc) && !hasCookie()) {
 		if full, exists := Models[modelName]; exists && !hasCookie() {
 			downgrade := "are silently downgraded to 3.5 Flash-Lite"
 			if full.Tool > 0 {
@@ -728,6 +750,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
 	t0 := time.Now()
 
+	// Do not emit possibly mislabelled output before the complete identity check.
+	if mc.RequireModelIdentity {
+		onDelta, onReasoning = nil, nil
+	}
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
 	strictCheck := strictLineCheck(mc, func() int64 { return cookieID })
@@ -886,6 +912,12 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
+		}
+		if reported, identityErr := verifyModelIdentity(mc, string(raw)); identityErr != nil {
+			res, _ := attrib(nil)
+			res.UpstreamModel = reported
+			res.TotalMs = time.Since(t0).Milliseconds()
+			return res, identityErr
 		}
 		if pickedOK {
 			recordProxyResult(picked.ID, true, "")
