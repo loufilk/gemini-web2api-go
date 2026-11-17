@@ -96,9 +96,8 @@ func geminiAPIToMessages(req *geminiAPIRequest) ([]map[string]interface{}, []map
 					args = []byte("{}")
 				}
 				id := p.FunctionCall.ID
-				if id == "" {
-					id = "call_" + randHex(8)
-				}
+				// Native history permits missing IDs. Do not fabricate an identifier
+				// that cannot be matched to the corresponding functionResponse.
 				calls = append(calls, map[string]interface{}{
 					"id": id, "type": "function",
 					"function": map[string]interface{}{"name": p.FunctionCall.Name, "arguments": string(args)},
@@ -501,7 +500,7 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		writeGeminiError(w, 400, err.Error())
 		return nil, false
 	}
-	images, err := collectImages(messages, "")
+	images, err := collectImagesContext(r.Context(), messages, "")
 	if err != nil {
 		writeGeminiError(w, 400, err.Error())
 		return nil, false
@@ -516,11 +515,8 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, latest: latest}, true
 }
 
-// run 调上游；多轮开关的分流跟 /v1/chat/completions 一致。
+// run 调上游，和 /v1/chat/completions 一样每次提交完整历史。
 func (g *geminiCall) run(onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
-	if rtCfg().MultiTurn && len(g.images) == 0 && g.modelCfg.Tool == 0 {
-		return callGeminiConv(g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning)
-	}
 	return callGemini(g.prompt, g.latest, g.modelCfg, g.tools, g.images, onDelta, onReasoning)
 }
 

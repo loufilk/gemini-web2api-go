@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -248,18 +249,22 @@ type RequestRow struct {
 }
 
 func insertRequest(r *RequestRow) {
-	_, err := getDB().Exec(`INSERT INTO requests
+	insertRequestContext(context.Background(), r)
+}
+
+func insertRequestContext(ctx context.Context, r *RequestRow) {
+	_, err := getDB().raw.ExecContext(ctx, rebind(`INSERT INTO requests
         (ts, model, upstream_model, proxy_id, proxy_name, account_id, account_label,
          status, error, ttfb_ms, total_ms,
          prompt_chars, response_chars, prompt_tokens, output_tokens,
          endpoint, stream, requested_model, canonical_model, actual_model, actual_model_verified, retry_count, failure_class, catalog_ms, upstream_first_text_ms, model_verified_ms, downstream_first_text_ms, first_tool_ms, first_reasoning_ms, generation_start_ms, first_heartbeat_ms, prompt_bytes, prompt_budget_bytes, context_attachment_used, prepare_ms)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		r.TS, r.Model, r.UpstreamModel, r.ProxyID, r.ProxyName, r.AccountID, r.AccountLabel,
 		r.Status, r.Error, r.TTFBMs, r.TotalMs,
 		r.PromptChars, r.ResponseChars, r.PromptTokens, r.OutputTokens,
 		r.Endpoint, r.Stream, r.RequestedModel, r.CanonicalModel, r.ActualModel, boolInt(r.ActualModelVerified), r.RetryCount, r.FailureClass, r.CatalogMs, r.UpstreamFirstTextMs, r.ModelVerifiedMs, r.DownstreamFirstTextMs, r.FirstToolMs, r.FirstReasoningMs, r.GenerationStartMs, r.FirstHeartbeatMs, r.PromptBytes, r.PromptBudgetBytes, nullableBoolInt(r.ContextAttachmentUsed), r.PrepareMs)
 	if err != nil {
-		logf("[db] insert request failed: %v", err)
+		logf("[db] insert request metadata failed")
 	}
 }
 

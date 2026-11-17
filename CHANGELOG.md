@@ -2,6 +2,14 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 4.28.1+chuanapi.models2.latency2
+
+- 修复按账号实际能力择号、发现预算和换号出口归属，保留严格型号与无盲重放。
+- 修复 Responses 图文/工具历史和 SSE 索引；明确保持无状态，关闭按历史自动共享上游会话。
+- 管理端默认拒绝无令牌访问；限制媒体出站与请求日志积压；修复视频任务竞态并增加 CI 门槛。
+- 升级及回退见 [ChuanAPI 修复说明](docs/chuanapi-latency-followup.md)。
+
+
 ## 4.28.1
 
 ### 修复

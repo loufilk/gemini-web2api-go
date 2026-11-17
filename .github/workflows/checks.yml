@@ -1,0 +1,29 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit and regression tests
+        run: go test -count=1 ./...
+      - name: Static analysis
+        run: go vet ./...
+      - name: Race regression tests
+        run: go test -race -count=1 ./...
+      - name: Build
+        run: go build ./...

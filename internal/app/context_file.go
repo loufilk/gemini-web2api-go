@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -78,13 +79,20 @@ func contextFilePrompt(latest string, budget int) string {
 // 答非所问的 200 却看不出问题。
 func prepareContextFile(prompt, latest string, budget int, cookie string, authuser int, proxyURL string) (
 	string, []fileRef, bool, error) {
+	return prepareContextFileContext(context.Background(), prompt, latest, budget, cookie, authuser, proxyURL)
+}
+
+func prepareContextFileContext(ctx context.Context, prompt, latest string, budget int, cookie string, authuser int, proxyURL string) (string, []fileRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, false, err
+	}
 	if budget <= 0 || len(prompt) <= budget {
 		return prompt, nil, false, nil
 	}
 	if cookie == "" {
 		return prompt, nil, false, nil // 匿名：引用会被回 1100，转了也没用
 	}
-	ref, err := uploadBytes(cookie, authuser, proxyURL, []byte(prompt), contextFileName)
+	ref, err := uploadBytesContext(ctx, cookie, authuser, proxyURL, []byte(prompt), contextFileName)
 	if err != nil {
 		return prompt, nil, false, fmt.Errorf("超长对话转附件失败: %w", err)
 	}

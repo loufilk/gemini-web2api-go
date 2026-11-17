@@ -118,6 +118,13 @@ func getXSRFContext(ctx context.Context, cookie string, authuser int, proxyURL s
 
 // getUploadTokens 取上传要用的 Push-ID / X-Client-Pctx，跟 XSRF token 同一份缓存。
 func getUploadTokens(cookie string, authuser int, proxyURL string) (pushID, pctx string, err error) {
+	return getUploadTokensContext(context.Background(), cookie, authuser, proxyURL)
+}
+
+func getUploadTokensContext(ctx context.Context, cookie string, authuser int, proxyURL string) (pushID, pctx string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	key := xsrfKey(cookie, authuser)
 
 	xsrfMu.Lock()
@@ -127,7 +134,7 @@ func getUploadTokens(cookie string, authuser int, proxyURL string) (pushID, pctx
 	}
 	xsrfMu.Unlock()
 
-	e, err := fetchAppTokens(cookie, authuser, proxyURL)
+	e, err := fetchAppTokensContext(ctx, cookie, authuser, proxyURL)
 	if err != nil {
 		return "", "", err
 	}

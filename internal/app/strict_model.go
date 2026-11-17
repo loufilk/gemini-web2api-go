@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,6 +79,20 @@ func coolingAccounts(mc ModelConfig) (map[int64]bool, time.Duration) {
 	return out, soonest
 }
 
+// Parent cancellation always wins over an internal preparation budget.
+func accountPreparationError(parent, preparation context.Context) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	if preparation.Err() != nil {
+		return &ModelAvailabilityError{Code: "model_discovery_budget_exhausted", Status: http.StatusServiceUnavailable}
+	}
+	return nil
+}
+
+// Bound preparation independently of the generation retry budget.
+const maxAccountPreparations = 8
+
 // pickAccountForModel 挑号，跳过 exclude（本次请求里已经被降级过的）和正在为 mc 冷却的号。
 // 返回的 skip 是两者合集，换号重取时要接着用它。
 //
@@ -96,8 +111,32 @@ func pickAccountForModel(mc ModelConfig, exclude map[int64]bool) (*CookieAccount
 			skip[id] = true
 		}
 	}
-	if a, ok := pickCookieAccountExcept(skip); ok {
+	// A fresh catalogue is authoritative only for its account identity and
+	// egress. Stale/absent entries remain discovery candidates, never negatives.
+	incompatible := 0
+	rank := func(a *CookieAccount) int {
+		if !mc.RequireModelIdentity {
+			return 0
+		}
+		if a.ProxyID > 0 && !proxyUsableByID(a.ProxyID) {
+			return 1
+		}
+		cat, ok := cachedAccountModels(a, proxyURLByID(a.ProxyID))
+		if !ok || cat.Stale {
+			return 1
+		}
+		if _, ok := routeFromCatalog(cat, mc); ok {
+			return 0
+		}
+		incompatible++
+		skip[a.ID] = true
+		return -1
+	}
+	if a, ok := pickCookieAccountRanked(skip, rank); ok {
 		return a, skip, nil
+	}
+	if incompatible > 0 && soonest == 0 {
+		return nil, skip, &ModelAvailabilityError{Code: "model_unavailable", Status: http.StatusNotFound}
 	}
 	if len(skip) > 0 && hasCookie() {
 		return nil, skip, &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: soonest}

@@ -9,7 +9,13 @@ permissions:
   contents: write   # 建 Release、传附件要写权限
 
 jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+    permissions:
+      contents: read
+
   build:
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

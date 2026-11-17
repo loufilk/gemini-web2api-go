@@ -47,10 +47,7 @@ type RuntimeConfig struct {
 	// 单位是字节不是 token：实测上游的墙按字节走，跟语言无关，见 messages.go。
 	// 0 = 关掉检查（原样发出，由上游从尾部静默截断）。
 	MaxPromptBytes int `json:"max_prompt_bytes"`
-	// MultiTurn 开启后走 Gemini 原生 conversation_id 服务端多轮：按历史前缀识别续接，
-	// 命中就只发最新一句、历史留服务端，绕开单请求字节墙。匿名/登录都行，见 conversation.go。
-	// 默认 false（保持现有"每轮拼全量 prompt"行为）。实测多轮不放大上下文窗口，只让长
-	// 对话不撞单请求墙——对 Codex 这类长会话有用，对"喂长文档"没用。
+	// MultiTurn is retained for backward compatibility and has no effect.
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果自动删掉 gemini.google.com 上的这条会话（#19）。只登录态生效。默认 false。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
@@ -58,8 +55,8 @@ type RuntimeConfig struct {
 	// 不占 cookie 账号，省账号额度；需要登录才挑号。默认 false，见 modelNeedsLogin。
 	AnonFirst bool `json:"anon_first"`
 	// 临时对话（#34）：塞 inner[45]=1，走网页端原生「临时对话」——不进会话列表、不入训练，
-	// 取代 auto_delete_conversation（省掉删除 RPC）。只登录态有意义，与 multi_turn 冲突
-	// （multi_turn 开着时不发）。默认 false，见 temporaryChatEligible。
+	// 取代 auto_delete_conversation（省掉删除 RPC）。只登录态有意义。
+	// 默认 false，见 temporaryChatEligible。
 	TemporaryChat bool `json:"temporary_chat"`
 	// 生成图放大（#62）：出图后发 rpc c8o8Fe 取网页「下载原图」那张放大版。要登录态；
 	// 失败退回原图、不重新生成。默认 false，见 image_upscale.go。

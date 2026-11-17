@@ -201,14 +201,10 @@ func anonFirstEligible(mc ModelConfig, hasAttachment bool) bool {
 	return rtCfg().AnonFirst && !hasAttachment && !modelNeedsLogin(mc)
 }
 
-// temporaryChatEligible 判断这次请求该不该走网页端原生「临时对话」（inner[45]=1，#34）。
-//
-// 与 multi_turn 冲突：临时对话不进会话列表，而 multi_turn 要按历史认出续接、靠服务端
-// 留着这串对话——两个一起开，续接那半就没了。所以 multi_turn 开着时一律不发 inner[45]，
-// 由 multi_turn 决定会话怎么留。调用点还会再要求有登录 cookie：匿名本来就不落账号，
-// 发 inner[45] 是没验过的无谓偏离。
+// temporaryChatEligible checks the native temporary-chat setting. Call sites
+// additionally require a signed-in account.
 func temporaryChatEligible() bool {
-	return rtCfg().TemporaryChat && !rtCfg().MultiTurn
+	return rtCfg().TemporaryChat
 }
 
 // availableModels 返回当前配置下值得暴露的模型。
@@ -441,6 +437,13 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			totalAttempts += next.GenerationAttempts
 			next.RetryCount = max(0, totalAttempts-1)
 		}
+		var unavailable *ModelAvailabilityError
+		if try > 0 && errors.As(nextErr, &unavailable) && unavailable.Status == 404 {
+			var last *ModelDowngradedError
+			if errors.As(err, &last) {
+				return res, err
+			}
+		}
 		var exhausted *ModelDowngradedError
 		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
 			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
@@ -461,6 +464,15 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string), exclude map[int64]bool) (*StreamResult, error) {
 	ctx := modelRequestContext(mc)
+	prepareCtx := ctx
+	cancelPrepare := func() {}
+	if mc.RequireModelIdentity {
+		// This bounds token/catalogue work. The legacy rotation helper has its
+		// own HTTP timeouts; check this deadline again immediately after it.
+		prepareCtx, cancelPrepare = context.WithTimeout(ctx, 24*time.Second)
+	}
+	defer cancelPrepare()
+	preflightErr := func() error { return accountPreparationError(ctx, prepareCtx) }
 	var files []fileRef
 	var capabilityErr error
 
@@ -496,6 +508,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	var picked Proxy
 	var cookieID int64
 	var cookieLabel string
+	if acct != nil {
+		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
+	}
 	var generationAttempts int
 	attrib := func(err error) (*StreamResult, error) {
 		return &StreamResult{
@@ -510,7 +525,12 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		return attrib(slotErr)
 	}
 	picked = p
-	defer releaseSlot(picked.ID) // picked.ID=0 表示直连 slot
+	slotHeld := true
+	defer func() {
+		if slotHeld {
+			releaseSlot(picked.ID)
+		}
+	}() // follows account/egress switches
 
 	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
 	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
@@ -521,41 +541,66 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	// 最多试 maxCookieTries 个。不这么做的话，池子里 2 个号坏 1 个就会让大约一半
 	// 请求挂掉，而每次失败看起来都像上游的问题，用户只会觉得"成功率莫名很低"。
 	//
-	// 换号**不换出口**：出口已经按第一个号的绑定选定了，同一个请求里再换出口没道理。
+	// Discovery/auth failures may switch accounts before any generation is sent.
+	// Reacquire using that account's preferred egress, not the first candidate's.
 	cookieStr, sapisid, xsrfToken := "", "", ""
 	authUser := 0 // 最终用上的那个号的账号序号（/u/N），匿名为 0
 	var lastCookieErr error
 	tried := map[int64]bool{}
 	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
 	rotatedOnce := map[int64]bool{}
-	for acct != nil && len(tried) < maxCookieTries {
+	authFailures := 0
+	nextAccount := func() *CookieAccount {
+		if mc.PinAccountID > 0 {
+			return nil
+		}
+		a, _, pickErr := pickAccountForModel(mc, mergeAccountExclusions(skip, tried))
+		if pickErr != nil {
+			var availability *ModelAvailabilityError
+			if errors.As(pickErr, &availability) {
+				capabilityErr = strongerModelAvailability(capabilityErr, pickErr)
+			}
+		}
+		return a
+	}
+	for acct != nil && len(tried) < maxAccountPreparations && authFailures < maxCookieTries {
+		if len(tried) > 0 {
+			releaseSlot(picked.ID)
+			slotHeld = false
+			picked = Proxy{}
+			cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
+			if ctx.Err() != nil {
+				return attrib(ctx.Err())
+			}
+			nextProxy, ok, slotErr := acquireSlot(acct.ProxyID)
+			if !ok {
+				return attrib(slotErr)
+			}
+			picked, slotHeld = nextProxy, true
+			proxyURL, pickedOK = picked.URL, picked.ID > 0
+		}
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		if ctx.Err() != nil {
-			return attrib(ctx.Err())
+		if err := preflightErr(); err != nil {
+			return attrib(err)
 		}
-		tok, err := getXSRFContext(ctx, acct.Cookie, acct.AuthUser, proxyURL)
+		tok, err := getXSRFContext(prepareCtx, acct.Cookie, acct.AuthUser, proxyURL)
 		if err == nil {
-			routed, accessErr := accountModelRoute(ctx, acct, proxyURL, mc)
+			routed, accessErr := accountModelRoute(prepareCtx, acct, proxyURL, mc)
 			if accessErr != nil {
-				capabilityErr = strongerModelAvailability(capabilityErr, accessErr)
-				next := mergeAccountExclusions(skip, tried)
-				acct = nil
-				if mc.PinAccountID == 0 {
-					acct, _ = pickCookieAccountExcept(next)
+				if err := preflightErr(); err != nil {
+					return attrib(err)
 				}
+				capabilityErr = strongerModelAvailability(capabilityErr, accessErr)
+				acct = nextAccount()
 				continue
 			}
 			mc = routed
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
 			authUser = acct.AuthUser
-			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
-			//
-			// 绝不因为"这次走的是别的出口"就覆盖：出口是按**本次第一个挑中的号**
-			// 的绑定选的，而挑号会换（新加的号 last_used_at=0 排在最前，撞上坏号
-			// 就会换）。拿别人的出口覆盖当前号的绑定，等于每次撞上坏号就把好号的
-			// 粘性打散一次 —— 实测就是这么散掉的。
+			// Keep a healthy existing affinity even if capacity forced a temporary
+			// alternate exit; bind only new accounts or unusable old exits.
 			if acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID) {
 				bindAccountProxy(acct.ID, picked.ID)
 			}
@@ -567,22 +612,21 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
 		// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
 		// 只试一次，且只在这一轮。
-		if ctx.Err() != nil {
-			return attrib(ctx.Err())
+		if err := preflightErr(); err != nil {
+			return attrib(err)
 		}
 		if !rotatedOnce[acct.ID] {
 			rotatedOnce[acct.ID] = true
 			if _, _, rerr := rotateAccount(*acct); rerr == nil {
 				if fresh := accountByID(acct.ID); fresh != nil {
-					if tok2, err2 := getXSRFContext(ctx, fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
-						routed, accessErr := accountModelRoute(ctx, fresh, proxyURL, mc)
+					if tok2, err2 := getXSRFContext(prepareCtx, fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
+						routed, accessErr := accountModelRoute(prepareCtx, fresh, proxyURL, mc)
 						if accessErr != nil {
-							capabilityErr = strongerModelAvailability(capabilityErr, accessErr)
-							next := mergeAccountExclusions(skip, tried)
-							acct = nil
-							if mc.PinAccountID == 0 {
-								acct, _ = pickCookieAccountExcept(next)
+							if err := preflightErr(); err != nil {
+								return attrib(err)
 							}
+							capabilityErr = strongerModelAvailability(capabilityErr, accessErr)
+							acct = nextAccount()
 							continue
 						}
 						mc = routed
@@ -598,6 +642,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 				}
 			}
 		}
+		if err := preflightErr(); err != nil {
+			return attrib(err)
+		}
 		// 救不回来：是 cookie 的错就记一次失败，让面板上看得出是哪个号该换了；
 		// 断网、出口被拦不记（见 xsrfErrBlamesCookie）。然后换下一个。
 		if xsrfErrBlamesCookie(err) {
@@ -609,19 +656,20 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			acct = nil // pinned: never switch to another account mid-conversation
 			continue
 		}
-		next := map[int64]bool{}
-		for id := range skip {
-			next[id] = true
-		}
-		for id := range tried {
-			next[id] = true
-		}
-		acct, _ = pickCookieAccountExcept(next) // 取不到时返回 nil，循环自然结束
+		authFailures++
+		acct = nextAccount()
 	}
-	if ctx.Err() != nil {
-		return attrib(ctx.Err())
+	if err := preflightErr(); err != nil {
+		return attrib(err)
 	}
+	cancelPrepare()
 	if mc.RequireModelIdentity && cookieStr == "" {
+		if authFailures >= maxCookieTries {
+			return attrib(&ModelAvailabilityError{Code: "model_account_unavailable", Status: 503})
+		}
+		if acct != nil {
+			return attrib(&ModelAvailabilityError{Code: "model_discovery_budget_exhausted", Status: 503})
+		}
 		if capabilityErr != nil {
 			return attrib(capabilityErr)
 		}
@@ -669,7 +717,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			if ctx.Err() != nil {
 				return attrib(ctx.Err())
 			}
-			ref, uerr := uploadBytes(cookieStr, authUser, proxyURL, u.Data, u.Name)
+			ref, uerr := uploadBytesContext(ctx, cookieStr, authUser, proxyURL, u.Data, u.Name)
 			if uerr != nil {
 				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
 			}
@@ -688,7 +736,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	budget := rtCfg().MaxPromptBytes
 	noteRequestPrompt(ctx, len(prompt), budget)
 	markRequestLatency(ctx, latencyPrepareStart)
-	promptWithContext, extraFiles, attached, prepareErr := prepareContextFile(prompt, latest, budget, cookieStr, authUser, proxyURL)
+	promptWithContext, extraFiles, attached, prepareErr := prepareContextFileContext(ctx, prompt, latest, budget, cookieStr, authUser, proxyURL)
 	markRequestLatency(ctx, latencyPrepareEnd)
 	if prepareErr == nil {
 		noteContextAttachment(ctx, attached)
@@ -752,8 +800,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	// 匿名两个值都能通，但没有理由继续偏离浏览器。
 	inner[41] = []interface{}{1}
 	// 临时对话（#34）：inner[45]=1 让这条不进账号的会话列表、不入训练。只在有登录
-	// cookie 时发——匿名本就不落账号，发了也没意义且没验过。multi_turn 开着时
-	// temporaryChatEligible 直接为假（两者冲突，见那里）。
+	// cookie 时发——匿名本就不落账号。
 	if temporaryChatEligible() && cookieStr != "" {
 		inner[45] = 1
 	}
@@ -998,10 +1045,14 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 				cid = extractConversationID(string(raw))
 			}
 			result.ConvCID, result.ConvRID = cid, rid
-			arts, rcid, aerr := fetchMediaArtifacts(
-				mc.Tool, string(raw), cid, rid,
+			arts, rcid, aerr := fetchMediaArtifactsContext(
+				ctx, mc.Tool, string(raw), cid, rid,
 				cookieStr, sapisid, xsrfToken, proxyURL, mime, authUser)
 			result.ConvRCID = rcid
+			result.TotalMs = time.Since(t0).Milliseconds()
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
 			if aerr != nil {
 				logf("[media] 取回产物失败")
 				result.MediaErr = aerr

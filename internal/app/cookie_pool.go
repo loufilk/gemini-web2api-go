@@ -425,6 +425,12 @@ func pickCookieAccount() (*CookieAccount, bool) {
 // 轮转会让大约一半请求撞上坏号 —— 表现就是"成功率莫名其妙很低"，而每次失败
 // 看起来都像是上游的问题。
 func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
+	return pickCookieAccountRanked(skip, nil)
+}
+
+// rank is local-only: negative excludes a known-incompatible account, lower
+// ranks win; existing health/least-recently-used order breaks ties.
+func pickCookieAccountRanked(skip map[int64]bool, rank func(*CookieAccount) int) (*CookieAccount, bool) {
 	pickMu.Lock()
 	defer pickMu.Unlock()
 	// 健康的排前面，同样健康的按最久未用轮转。
@@ -439,6 +445,8 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 		return nil, false
 	}
 	defer rows.Close()
+	var best *CookieAccount
+	bestRank := int(^uint(0) >> 1)
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
@@ -448,8 +456,25 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 		if skip[a.ID] {
 			continue
 		}
-		_, _ = getDB().Exec(`UPDATE accounts SET last_used_at=? WHERE id=?`, time.Now().Unix(), a.ID)
-		return &a, true
+		r := 0
+		if rank != nil {
+			r = rank(&a)
+		}
+		if r >= 0 && r < bestRank {
+			best, bestRank = &a, r
+			if r == 0 {
+				break
+			} // zero is the minimum possible rank
+		}
+	}
+	// Release the SQLite reader before acquiring a writer connection.
+	if rows.Err() != nil {
+		return nil, false
+	}
+	_ = rows.Close()
+	if best != nil {
+		_, _ = getDB().Exec(`UPDATE accounts SET last_used_at=? WHERE id=?`, time.Now().Unix(), best.ID)
+		return best, true
 	}
 	return nil, false
 }

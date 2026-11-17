@@ -123,7 +123,7 @@ the single file is the whole thing:
 
 ```bash
 chmod +x gemini-web2api-go_*
-./gemini-web2api-go_* --port 8083 --admin-token your-admin-token
+./gemini-web2api-go_* --port 8083 --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN first}"
 ```
 
 Data lands in `./data/gemini.db` by default; pass `--db /your/path.db` to move it.
@@ -145,7 +145,7 @@ Tables are created automatically; all three backends share one schema. Single in
 docker run -d --name gemini-web2api \
   -p 127.0.0.1:8083:8083 \
   -v "$PWD/data:/data" \
-  -e ADMIN_TOKEN=your-admin-token \
+  -e ADMIN_TOKEN="${ADMIN_TOKEN:?set ADMIN_TOKEN first}" \
   ghcr.io/zexadev/gemini-web2api-go:latest
 ```
 
@@ -153,7 +153,7 @@ For compose, just grab the file — no clone required:
 
 ```bash
 curl -O https://raw.githubusercontent.com/zexadev/gemini-web2api-go/main/docker-compose.yml
-ADMIN_TOKEN=your-admin-token docker compose up -d
+ADMIN_TOKEN="${ADMIN_TOKEN:?set ADMIN_TOKEN first}" docker compose up -d
 ```
 
 ### From source
@@ -164,7 +164,7 @@ If you have Go, skip Docker entirely:
 git clone https://github.com/zexadev/gemini-web2api-go
 cd gemini-web2api-go
 go build -o gemini-web2api-go .
-./gemini-web2api-go --port 8083 --admin-token your-admin-token
+./gemini-web2api-go --port 8083 --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN first}"
 ```
 
 Changed the code and want it in a container? Uncomment the two `build:` lines in
@@ -425,7 +425,7 @@ Not returning a URL is deliberate — Gemini's artifact links need the cookie to
 
 **For bigger, sharper images**, turn on **Full-size image download** (`image_upscale`) on the admin panel's Settings page. Images are then fetched the way the web app's Download button does it: on **Ultra accounts** the image is upscaled 2× in each dimension (1376×768 → 2752×1536, about 3-4.5 MB); **other accounts** don't get the upscale, but they get the original file instead of the recompressed one (same size, about 0.8 MB vs about 0.2 MB by default). It costs one extra request per image and a several-times larger response. If it fails, the default image is returned; nothing is regenerated.
 
-**By default, multi-turn context is sent by flattening `messages` into a single prompt** (turn on server-side multi-turn, `multi_turn`, in Settings and a recognised continuation sends only the latest message while the history stays server-side; see [Configuration](#configuration)). The cost of flattening is that every turn resends the whole history, which runs into the single-request length wall: about **130,000 UTF-8 bytes**. Past that the upstream **silently truncates from the tail without an error** — and since the newest message sits at the end, what gets eaten is exactly what you just asked, which reads as "the model suddenly got dumb".
+**Each request flattens the client-supplied `messages` into a single prompt.** Always resend the full history. History-prefix session reuse is disabled to prevent different callers from sharing an upstream conversation. This keeps the single-request length wall: about **130,000 UTF-8 bytes**. Past that the upstream **silently truncates from the tail without an error** — and since the newest message sits at the end, what gets eaten is exactly what you just asked, which reads as "the model suddenly got dumb".
 
 With a cookie, an over-long conversation is uploaded as a `message.txt` attachment instead, which gets around the request-body wall — **but the attachment has a wall of its own**: the model only ever sees about **160,000 bytes** of content in total; anything past that is uploaded but never read (measured with the total size held fixed and only the marker's offset moved: readable at 157,833, not readable at 163,371; splitting into several attachments does not raise the budget). So a cookie takes the usable length from 130K to about 160K — **a genuinely long conversation still has to be compacted by the client**. Without a cookie the request is rejected with 400 `context_length_exceeded` rather than losing data silently.
 
@@ -442,7 +442,7 @@ Saving takes effect **immediately**, no restart. Values live in the database and
 | Default model | used when the client doesn't send `model` |
 | Per-slot concurrency / RPM / RPH | rate limits, 0 = unlimited |
 | Prompt byte cap | over the cap: with a cookie the history is sent as a text attachment (usable length up to ~160,000 bytes), without one the request is rejected with 400 `context_length_exceeded`. Neither path truncates silently. Counted in UTF-8 bytes (the upstream limit is byte-based, not token-based), default 128000. 0 = unlimited |
-| Multi-turn (`multi_turn`) | off by default. When on, uses Gemini's native conversation_id server-side continuation — the client resends full history each turn, the server detects the continuation and sends only the newest message while history stays server-side, so long conversations no longer hit the single-request byte wall. Works signed-in or anonymous. **Note**: it does not enlarge the model's context window; content past the window is still evicted (recent-kept sliding window). It solves "long chat without hitting the wall + keep recent context", not "feed a huge document". |
+| Multi-turn (`multi_turn`) | Deprecated compatibility field; ignored. Supply full history on every request. |
 | Auto-delete conversation (`auto_delete_conversation`) | off by default. When on, each finished request deletes the conversation it left on gemini.google.com, so signed-in accounts don't pile them up. Signed-in only; async best-effort, a failed delete doesn't affect the response. |
 | Temporary chat (`temporary_chat`) | off by default. When on, uses Gemini web's native **Temporary Chat** (`inner[45]=1`): the conversation never enters the account's chat list and isn't used for model training — cleaner than auto-delete, and it saves that extra delete request. Only meaningful signed-in; automatically inactive when server-side multi-turn is on (a temporary chat leaves no list entry, while multi-turn relies on the server keeping the conversation). |
 | Full-size image download (`image_upscale`) | off by default. When on, generated images are fetched the way the web app's Download button does: upscaled 2× in each dimension on Ultra accounts, the original (not recompressed) file on other accounts. One extra request per image; falls back to the default image if it fails. See "Image & music" above. |
@@ -500,7 +500,7 @@ All flags:
 | `--port` | listening port, default 8083 |
 | `--config` | path to `config.json` |
 | `--db` | SQLite path, default `./data/gemini.db` |
-| `--admin-token` | panel login token; empty = no auth (only acceptable when bound to 127.0.0.1) |
+| `--admin-token` | panel login token; empty = admin access disabled; configure a token |
 | `--api-key` | pins the `/v1/*` key so the panel can't change it, same as the `API_KEY` env var |
 | `--cookie-file` | imports the cookie in this file into the cookie pool at startup |
 | `--proxy` | imports this proxy into the proxy pool at startup |
@@ -642,7 +642,7 @@ internal/app/              everything else
   client.go                tls-client (chrome146) + stdlib (when proxied)
   gemini.go                model table + 80-slot payload + model header + StreamGenerate + wrb.fr parsing
   webchannel.go            new-protocol transport, processSession (WebChannel), switch web_channel
-  conversation.go          server-side multi-turn (multi_turn): matches the history prefix, sends only the latest message
+  conversation.go          extracts upstream conversation IDs for per-request cleanup
   media.go                 image / music / canvas / video: tool slot, artifact extraction and download
   image_upscale.go         full-size / upscaled image download (rpc c8o8Fe, switch image_upscale)
   search.go                web-search source extraction
@@ -705,7 +705,7 @@ docker-compose.yml         single container, pulls the ghcr image by default, sq
 | Every request returns 502 after attaching a cookie | The cookie expired, so the XSRF token can't be fetched | Re-export the cookie. Quick check: if `gemini-3.1-pro` reports 3.5 Flash-Lite, it's expired |
 | Cookie dies in about 30 minutes; keepalive does nothing | Chrome device-bound session; rotating `__Secure-1PSIDTS` returns 401 | Re-login in **Firefox** and export again. The panel Keep-alive button should report that `__Secure-1PSIDTS` was refreshed |
 | Cookie from a paid account, but paid models report 3.5 Flash-Lite and "check" says the session is valid | Several Google accounts are signed in to the browser and the subscription isn't on the default one, so requests land on the default account | Set the "account index" for that entry in the Cookie pool (`/u/1/` in that account's Gemini address bar means 1); see above |
-| Panel won't open / 401 | `--admin-token` (or `ADMIN_TOKEN`) doesn't match | An empty token disables auth, which is only acceptable when bound to 127.0.0.1 |
+| Panel won't open / 401 | `--admin-token` (or `ADMIN_TOKEN`) doesn't match | An empty token disables admin access; configure `ADMIN_TOKEN` |
 
 With Docker's default bridge network, upstream may return empty content (Google rejects certain NAT ranges). We have **never reproduced it here**. If you hit it, try `network_mode: host` to confirm whether that is the cause.
 
@@ -750,9 +750,7 @@ and video generation (`gemini-video` / `/v1/videos`). Hydrogen also requires acc
 
 ### Why does every message create a new conversation on gemini.google.com?
 
-Each request is its own conversation by default. Enable **server-side multi-turn** (`multi_turn`) on the panel's
-Settings page and consecutive messages of one conversation reuse the same web session, sending only the newest
-turn while history stays server-side. To stop conversations piling up in the web app, you have two options:
+Each request is its own conversation; identical histories do not cause upstream session reuse. To stop conversations piling up in the web app, you have two options:
 enable **temporary chat** (`temporary_chat`) so the conversation never enters the list at all (cleaner, not used
 for training, nothing to delete — recommended), or enable **auto-delete web conversation**
 (`auto_delete_conversation`) to delete it after each reply. Both only matter for signed-in accounts.
@@ -817,3 +815,7 @@ MIT — see [LICENSE](LICENSE)
 
 [![LinuxDo](https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LinuxDo-blue?style=for-the-badge)](https://linux.do/)
 
+
+### Admin-token upgrade note
+
+An empty admin token disables admin API access, not the API gateway. Compose no longer supplies a shared default token. Run `export ADMIN_TOKEN="$(openssl rand -hex 32)"` first to generate a random token; securely save it (for example in a protected environment configuration), then pass it through `ADMIN_TOKEN` for login and reuse across restarts. Never use documentation placeholders as passwords or commit tokens to Git.

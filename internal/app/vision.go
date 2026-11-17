@@ -1,13 +1,12 @@
 package app
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-
-	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 // 读图 / 读视频：把客户端传来的图片或视频上传成附件，再在对话里引用。
@@ -40,7 +39,12 @@ type pendingUpload struct {
 // 图片来源支持 data URL 和 http(s) 链接，后者会下载下来再传 —— 直接把链接给上游
 // 是不行的，它只认自己存储里的附件。
 func collectImages(messages []map[string]interface{}, proxyURL string) ([]pendingUpload, error) {
+	return collectImagesContext(context.Background(), messages, proxyURL)
+}
+
+func collectImagesContext(ctx context.Context, messages []map[string]interface{}, proxyURL string) ([]pendingUpload, error) {
 	var out []pendingUpload
+	totalBytes := 0
 	for _, m := range messages {
 		parts, ok := m["content"].([]interface{})
 		if !ok {
@@ -75,9 +79,13 @@ func collectImages(messages []map[string]interface{}, proxyURL string) ([]pendin
 			if strings.TrimSpace(src) == "" {
 				continue
 			}
-			img, err := materializeImage(src, proxyURL, len(out)+1)
+			img, err := materializeImageContext(ctx, src, proxyURL, len(out)+1)
 			if err != nil {
 				return nil, err
+			}
+			totalBytes += len(img.Data)
+			if totalBytes > maxArtifactBytes {
+				return nil, fmt.Errorf("request attachments exceed %d-byte limit", maxArtifactBytes)
 			}
 			out = append(out, img)
 		}
@@ -96,11 +104,18 @@ func firstNonEmpty(vals ...string) string {
 
 // materializeImage 把一个图片来源变成待上传的字节。
 func materializeImage(src, proxyURL string, idx int) (pendingUpload, error) {
+	return materializeImageContext(context.Background(), src, proxyURL, idx)
+}
+
+func materializeImageContext(ctx context.Context, src, proxyURL string, idx int) (pendingUpload, error) {
+	if err := ctx.Err(); err != nil {
+		return pendingUpload{}, err
+	}
 	if strings.HasPrefix(src, "data:") {
 		return decodeDataURL(src, idx)
 	}
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-		return fetchImage(src, proxyURL, idx)
+		return fetchImageContext(ctx, src, proxyURL, idx)
 	}
 	return pendingUpload{}, fmt.Errorf("image %d: unsupported source (want a data: URL or http(s) link)", idx)
 }
@@ -118,6 +133,17 @@ func decodeDataURL(src string, idx int) (pendingUpload, error) {
 	} else if meta != "" {
 		mime = meta
 	}
+	limit := maxImageBytes
+	if strings.HasPrefix(mime, "video/") {
+		limit = maxVideoBytes
+	}
+	encodedLimit := limit
+	if strings.Contains(meta, "base64") {
+		encodedLimit = base64.StdEncoding.EncodedLen(limit)
+	}
+	if len(payload) > encodedLimit {
+		return pendingUpload{}, fmt.Errorf("media %d: encoded data exceeds limit", idx)
+	}
 	var data []byte
 	var err error
 	if strings.Contains(meta, "base64") {
@@ -131,49 +157,49 @@ func decodeDataURL(src string, idx int) (pendingUpload, error) {
 	return newMediaUpload(data, mime, idx)
 }
 
-// fetchImage 下载远程图片。走跟正式请求同一个出口：图从别的 IP 拉、对话从这个 IP 发，
-// 除了慢一点没别的好处，还多暴露一个出口。
+// fetchImage downloads untrusted remote attachments through a public-only,
+// credential-free direct transport. Google uploads still use the account proxy.
 func fetchImage(src, proxyURL string, idx int) (pendingUpload, error) {
-	var body []byte
-	var ctype string
-	if proxyURL != "" {
-		req, err := http.NewRequest("GET", src, nil)
-		if err != nil {
-			return pendingUpload{}, err
-		}
-		applyChromeHeaders(req)
-		resp, err := getStdlibClient(proxyURL).Do(req)
-		if err != nil {
-			return pendingUpload{}, fmt.Errorf("image %d: fetch failed: %w", idx, err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return pendingUpload{}, fmt.Errorf("image %d: fetch returned HTTP %d", idx, resp.StatusCode)
-		}
-		ctype = resp.Header.Get("Content-Type")
-		body, err = io.ReadAll(io.LimitReader(resp.Body, maxImageBytes+1))
-		if err != nil {
-			return pendingUpload{}, err
-		}
-	} else {
-		req, err := fhttp.NewRequest("GET", src, nil)
-		if err != nil {
-			return pendingUpload{}, err
-		}
-		resp, err := getTLSClient().Do(req)
-		if err != nil {
-			return pendingUpload{}, fmt.Errorf("image %d: fetch failed: %w", idx, err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return pendingUpload{}, fmt.Errorf("image %d: fetch returned HTTP %d", idx, resp.StatusCode)
-		}
-		ctype = resp.Header.Get("Content-Type")
-		body, err = io.ReadAll(io.LimitReader(resp.Body, maxImageBytes+1))
-		if err != nil {
-			return pendingUpload{}, err
-		}
+	return fetchImageContext(context.Background(), src, proxyURL, idx)
+}
+
+func fetchImageContext(ctx context.Context, src, proxyURL string, idx int) (pendingUpload, error) {
+	if err := userMediaURL(src); err != nil {
+		return pendingUpload{}, err
 	}
+	if proxyURL != "" {
+		return pendingUpload{}, fmt.Errorf("remote media via proxy is unsupported; use a data URL")
+	}
+	ctx, cancel := context.WithTimeout(ctx, mediaIOTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", src, nil)
+	if err != nil {
+		return pendingUpload{}, fmt.Errorf("invalid remote media URL")
+	}
+	resp, err := newUserMediaClient().Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return pendingUpload{}, ctx.Err()
+		}
+		return pendingUpload{}, fmt.Errorf("image %d: fetch failed", idx)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return pendingUpload{}, fmt.Errorf("image %d: fetch returned HTTP %d", idx, resp.StatusCode)
+	}
+	return materializeMediaBody(resp.Body, resp.Header.Get("Content-Type"), idx)
+}
+
+func materializeMediaBody(r io.Reader, ctype string, idx int) (pendingUpload, error) {
+	limit := int64(maxImageBytes)
+	if strings.HasPrefix(ctype, "video/") {
+		limit = maxVideoBytes
+	}
+	body, err := readMediaBody(r, limit)
+	if err != nil {
+		return pendingUpload{}, err
+	}
+
 	if i := strings.Index(ctype, ";"); i > 0 {
 		ctype = ctype[:i]
 	}
@@ -186,6 +212,7 @@ func fetchImage(src, proxyURL string, idx int) (pendingUpload, error) {
 // newMediaUpload 按 mime 决定这是图片还是视频：
 //   - video/* → 附件类型位 2（跟抓包一致：文件元组 [路径,2,null,"video/mp4"]），上限 maxVideoBytes；
 //   - 其余当图片 → 类型位 1，上限 maxImageBytes。
+//
 // 类型位 1/2 是服务端认媒体种类的开关，填错模型就按错的类型解析附件。
 func newMediaUpload(data []byte, mime string, idx int) (pendingUpload, error) {
 	if len(data) == 0 {

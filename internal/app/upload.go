@@ -2,8 +2,8 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,7 +20,13 @@ const uploadHost = "https://push.clients6.google.com/upload/"
 // 匿名也能传成功，但传上去的文件在对话里引用会被回 1100，所以调用方要自己确保有 cookie。
 // proxyURL 必须跟正式请求同一出口，否则在 Google 眼里是两个会话共用文件。
 func uploadBytes(cookie string, authuser int, proxyURL string, data []byte, filename string) (string, error) {
-	pushID, pctx, err := getUploadTokens(cookie, authuser, proxyURL)
+	return uploadBytesContext(context.Background(), cookie, authuser, proxyURL, data, filename)
+}
+
+func uploadBytesContext(ctx context.Context, cookie string, authuser int, proxyURL string, data []byte, filename string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, mediaIOTimeout)
+	defer cancel()
+	pushID, pctx, err := getUploadTokensContext(ctx, cookie, authuser, proxyURL)
 	if err != nil {
 		return "", fmt.Errorf("取上传页面参数失败: %w", err)
 	}
@@ -63,13 +69,13 @@ func uploadBytes(cookie string, authuser int, proxyURL string, data []byte, file
 		"X-Goog-Upload-Protocol":              "resumable",
 		"X-Goog-Upload-Header-Content-Length": strconv.Itoa(len(data)),
 	})
-	status, respHead, body, err := uploadPost(uploadStartURL(authuser), startHeaders,
+	status, respHead, body, err := uploadPostContext(ctx, uploadStartURL(authuser), startHeaders,
 		[]byte("File name: "+sanitizeUploadName(filename)), proxyURL)
 	if err != nil {
 		return "", fmt.Errorf("上传 start 失败: %w", err)
 	}
 	if status != 200 {
-		return "", fmt.Errorf("上传 start 返回 HTTP %d: %s", status, truncate(string(body), 160))
+		return "", fmt.Errorf("上传 start 返回 HTTP %d", status)
 	}
 	putURL := respHead["x-goog-upload-url"]
 	if putURL == "" {
@@ -82,18 +88,18 @@ func uploadBytes(cookie string, authuser int, proxyURL string, data []byte, file
 		"X-Goog-Upload-Command": "upload, finalize",
 		"X-Goog-Upload-Offset":  "0",
 	})
-	status, _, body, err = uploadPost(putURL, upHeaders, data, proxyURL)
+	status, _, body, err = uploadPostContext(ctx, putURL, upHeaders, data, proxyURL)
 	if err != nil {
 		return "", fmt.Errorf("上传 finalize 失败: %w", err)
 	}
 	if status != 200 {
-		return "", fmt.Errorf("上传 finalize 返回 HTTP %d: %s", status, truncate(string(body), 160))
+		return "", fmt.Errorf("上传 finalize 返回 HTTP %d", status)
 	}
 	// 响应体就是引用路径。不以 "/" 开头说明拿到的是错误页，填进 payload 服务端
 	// 未必报错，但模型看到的附件是空的。
 	ref := strings.TrimSpace(string(body))
 	if !strings.HasPrefix(ref, "/") {
-		return "", fmt.Errorf("上传返回的不是引用路径: %s", truncate(ref, 160))
+		return "", fmt.Errorf("上传返回的不是引用路径")
 	}
 	return ref, nil
 }
@@ -110,8 +116,28 @@ func sanitizeUploadName(name string) string {
 // uploadPost 走跟主请求相同的出口发 POST，响应头一起带回（start 要取 x-goog-upload-url）。
 func uploadPost(url string, headers map[string]string, body []byte, proxyURL string) (
 	int, map[string]string, []byte, error) {
+	return googleRPCPostContext(context.Background(), url, headers, body, proxyURL)
+}
+
+func uploadPostContext(ctx context.Context, url string, headers map[string]string, body []byte, proxyURL string) (int, map[string]string, []byte, error) {
+	if err := trustedMediaURL(url, true); err != nil {
+		return 0, nil, nil, err
+	}
+	return mediaPostContext(ctx, url, headers, body, proxyURL, 1<<20)
+}
+
+func googleRPCPostContext(ctx context.Context, url string, headers map[string]string, body []byte, proxyURL string) (int, map[string]string, []byte, error) {
+	if err := trustedGoogleRPCURL(url); err != nil {
+		return 0, nil, nil, err
+	}
+	return mediaPostContext(ctx, url, headers, body, proxyURL, 16<<20)
+}
+
+func mediaPostContext(ctx context.Context, url string, headers map[string]string, body []byte, proxyURL string, responseLimit int64) (int, map[string]string, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, mediaIOTimeout)
+	defer cancel()
 	if proxyURL != "" {
-		req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -121,17 +147,17 @@ func uploadPost(url string, headers map[string]string, body []byte, proxyURL str
 		}
 		resp, err := getStdlibClient(proxyURL).Do(req)
 		if err != nil {
-			return 0, nil, nil, err
+			return 0, nil, nil, mediaTransportError(ctx)
 		}
 		defer resp.Body.Close()
-		b, err := io.ReadAll(resp.Body)
+		b, err := readMediaBody(resp.Body, responseLimit)
 		h := map[string]string{}
 		for k := range resp.Header {
 			h[strings.ToLower(k)] = resp.Header.Get(k)
 		}
 		return resp.StatusCode, h, b, err
 	}
-	req, err := fhttp.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := fhttp.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -140,10 +166,10 @@ func uploadPost(url string, headers map[string]string, body []byte, proxyURL str
 	}
 	resp, err := getTLSClient().Do(req)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, mediaTransportError(ctx)
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	b, err := readMediaBody(resp.Body, responseLimit)
 	h := map[string]string{}
 	for k := range resp.Header {
 		h[strings.ToLower(k)] = resp.Header.Get(k)

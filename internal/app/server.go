@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Version = "4.28.1+chuanapi.models2.latency1"
+const Version = "4.28.1+chuanapi.models2.latency2"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -179,7 +179,7 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 		text, toolCalls = parseToolCalls(text)
 	}
 	// 回复只有一个解析不了的 ```tool_call``` 围栏（JSON 写坏 / 没有工具名）时，
-	// parseToolCalls 剥掉围栏后正文为空、也没有调用。跟 callGeminiConv 一样报错，
+	// parseToolCalls 剥掉围栏后正文为空、也没有调用；必须报错，
 	// 不能回 200 + content:null 且不带 tool_calls —— 客户端看不出请求其实失败了。
 	if text == "" && len(toolCalls) == 0 {
 		return "", nil, res, fmt.Errorf("upstream reply had only an unparseable tool_call block (raw %d bytes)", len(res.Raw))
@@ -236,13 +236,16 @@ func recordTimedRequest(ctx context.Context, endpoint, model, prompt, response s
 			r.FailureClass = res.FailureClass
 		}
 		r.TotalMs = res.TotalMs
-		r.TTFBMs = &res.TTFBMs
+		ttfb := res.TTFBMs
+		r.TTFBMs = &ttfb
 		if res.ProxyID > 0 {
-			r.ProxyID = &res.ProxyID
+			id := res.ProxyID
+			r.ProxyID = &id
 		}
 		r.ProxyName = res.ProxyName
 		if res.AccountID > 0 {
-			r.AccountID = &res.AccountID
+			id := res.AccountID
+			r.AccountID = &id
 		}
 		r.AccountLabel = res.AccountLabel
 		if r.AccountLabel == "" && res.AccountID > 0 {
@@ -265,17 +268,14 @@ func recordTimedRequest(ctx context.Context, endpoint, model, prompt, response s
 		r.ContextAttachmentUsed = lat.ContextAttachmentUsed
 	}
 
-	go insertRequest(r)
+	requestLogQueue().enqueue(r)
 }
 
 // runOpenAIModel shares the same model selection across Chat and Responses.
-var runOpenAIModel = func(messages []map[string]interface{}, prompt, latest string, mc ModelConfig,
-	tools []map[string]interface{}, toolChoice interface{}, images []pendingUpload,
+var runOpenAIModel = func(_ []map[string]interface{}, prompt, latest string, mc ModelConfig,
+	tools []map[string]interface{}, _ interface{}, images []pendingUpload,
 	onDelta, onReasoning func(string),
 ) (string, []ToolCall, *StreamResult, error) {
-	if rtCfg().MultiTurn && len(images) == 0 && mc.Tool == 0 {
-		return callGeminiConv(messages, mc, tools, toolChoice, onDelta, onReasoning)
-	}
 	return callGemini(prompt, latest, mc, tools, images, onDelta, onReasoning)
 }
 
@@ -325,7 +325,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 图片先解出来带着，真正上传要等挑完账号和出口（见 streamGenerate）。
-	images, err := collectImages(messages, "")
+	images, err := collectImagesContext(r.Context(), messages, "")
 	if err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
 			"message": err.Error(), "type": "invalid_request_error"}})
@@ -543,6 +543,13 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	messages, err := normalizeResponsesInput(req)
+	if err != nil {
+		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+			"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+
 	modelInput := getStr(req, "model")
 	if modelInput == "" {
 		modelInput = rtCfg().DefaultModel
@@ -551,80 +558,6 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": err.Error()}})
 		return
-	}
-
-	var messages []map[string]interface{}
-	if instr := getStr(req, "instructions"); instr != "" {
-		messages = append(messages, map[string]interface{}{"role": "system", "content": instr})
-	}
-
-	switch input := req["input"].(type) {
-	case string:
-		messages = append(messages, map[string]interface{}{"role": "user", "content": input})
-	case []interface{}:
-		for _, raw := range input {
-			switch item := raw.(type) {
-			case string:
-				messages = append(messages, map[string]interface{}{"role": "user", "content": item})
-			case map[string]interface{}:
-				if t := getStr(item, "type"); t == "function_call_output" {
-					messages = append(messages, map[string]interface{}{
-						"role":         "tool",
-						"tool_call_id": getStr(item, "call_id"),
-						"name":         getStr(item, "name"),
-						"content":      getStr(item, "output"),
-					})
-					continue
-				}
-				role := getStr(item, "role")
-				if role == "assistant" || (getStr(item, "type") == "message" && role == "assistant") {
-					var textAcc strings.Builder
-					var tcList []map[string]interface{}
-					if cp, ok := item["content"].([]interface{}); ok {
-						for _, c := range cp {
-							cm, ok := c.(map[string]interface{})
-							if !ok {
-								continue
-							}
-							switch getStr(cm, "type") {
-							case "output_text":
-								textAcc.WriteString(getStr(cm, "text"))
-							case "function_call":
-								tcList = append(tcList, cm)
-							}
-						}
-					} else if s, ok := item["content"].(string); ok {
-						textAcc.WriteString(s)
-					}
-					m := map[string]interface{}{"role": "assistant", "content": textAcc.String()}
-					if len(tcList) > 0 {
-						var tcs []map[string]interface{}
-						for i, tc := range tcList {
-							id := getStr(tc, "call_id")
-							if id == "" {
-								id = fmt.Sprintf("call_%d", i)
-							}
-							tcs = append(tcs, map[string]interface{}{
-								"id":   id,
-								"type": "function",
-								"function": map[string]interface{}{
-									"name":      getStr(tc, "name"),
-									"arguments": getStr(tc, "arguments"),
-								},
-							})
-						}
-						m["tool_calls"] = tcs
-					}
-					messages = append(messages, m)
-				} else {
-					if role == "" {
-						role = "user"
-					}
-					content := contentToString(item["content"])
-					messages = append(messages, map[string]interface{}{"role": role, "content": content})
-				}
-			}
-		}
 	}
 
 	toolsRaw, _ := req["tools"].([]interface{})
@@ -655,7 +588,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	images, err := collectImages(messages, "")
+	images, err := collectImagesContext(r.Context(), messages, "")
 	if err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
 			"message": err.Error(), "type": "invalid_request_error"}})
@@ -719,6 +652,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"response": map[string]interface{}{
 					"id":     rid,
 					"object": "response",
+					"store":  false,
 					"status": "in_progress",
 					"model":  modelName,
 					"output": []interface{}{},
@@ -809,6 +743,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"response": map[string]interface{}{
 					"id":     rid,
 					"object": "response",
+					"store":  false,
 					"status": "failed",
 					"model":  modelName,
 					"error":  errObj,
@@ -851,30 +786,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if stream && modelCfg.RequireModelIdentity {
 		startResponse()
 	}
-	var output []map[string]interface{}
-	for _, tc := range toolCalls {
-		output = append(output, map[string]interface{}{
-			"type":      "function_call",
-			"id":        tc.ID,
-			"call_id":   tc.ID,
-			"name":      tc.Function.Name,
-			"arguments": tc.Function.Arguments,
-			"status":    "completed",
-		})
-	}
-	if text != "" || len(toolCalls) == 0 {
-		output = append(output, map[string]interface{}{
-			"type":   "message",
-			"id":     mid,
-			"role":   "assistant",
-			"status": "completed",
-			"content": []map[string]interface{}{{
-				"type":        "output_text",
-				"text":        text,
-				"annotations": []interface{}{},
-			}},
-		})
-	}
+	// Keep the completed array in the same order in which SSE items are declared:
+	// text is emitted before tool calls, which stay buffered until successful completion.
+	output := responseOutputItems(mid, text, toolCalls, msgIndex >= 0)
 
 	if stream {
 		// 补上闸门扣住、或前缀 diff 跳过的尾巴，再发终态事件。
@@ -891,11 +805,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 					"type": "response.output_item.added", "output_index": idx, "item": item,
 				})
 				writeEvent("response.function_call_arguments.done", map[string]interface{}{
-					"type":      "response.function_call_arguments.done",
-					"item_id":   item["id"],
-					"call_id":   item["call_id"],
-					"name":      item["name"],
-					"arguments": item["arguments"],
+					"type":         "response.function_call_arguments.done",
+					"output_index": idx,
+					"item_id":      item["id"],
+					"call_id":      item["call_id"],
+					"name":         item["name"],
+					"arguments":    item["arguments"],
 				})
 				writeEvent("response.output_item.done", map[string]interface{}{
 					"type": "response.output_item.done", "output_index": idx, "item": item,
@@ -927,6 +842,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		respObj := map[string]interface{}{
 			"id":     rid,
 			"object": "response",
+			"store":  false,
 			"status": "completed",
 			"model":  modelName,
 			"output": output,
@@ -946,6 +862,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"id":         rid,
 		"object":     "response",
+		"store":      false,
 		"created_at": time.Now().Unix(),
 		"status":     "completed",
 		"model":      modelName,
@@ -1008,7 +925,7 @@ func writeGenerationError(w http.ResponseWriter, err error) {
 
 func safeFailureCode(code string) bool {
 	switch code {
-	case "client_canceled", "client_deadline", "upstream_timeout", "upstream_first_frame_timeout", "upstream_idle_timeout", "upstream_overall_timeout", "model_session_account_changed", "model_account_unavailable", "upstream_error", "model_identity_mismatch", "model_identity_unverified", "model_downgraded", "ip_slot_full", "context_length_exceeded", "model_catalog_unavailable", "model_not_found", "model_unavailable", "proxy_unavailable", "upstream_incomplete":
+	case "client_canceled", "client_deadline", "upstream_timeout", "upstream_first_frame_timeout", "upstream_idle_timeout", "upstream_overall_timeout", "model_session_account_changed", "model_account_unavailable", "upstream_error", "model_identity_mismatch", "model_identity_unverified", "model_downgraded", "ip_slot_full", "context_length_exceeded", "model_catalog_unavailable", "model_discovery_budget_exhausted", "model_not_found", "model_unavailable", "proxy_unavailable", "upstream_incomplete":
 		return true
 	}
 	return false

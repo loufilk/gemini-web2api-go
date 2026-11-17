@@ -1,12 +1,16 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -18,17 +22,6 @@ func logf(format string, args ...interface{}) {
 	}
 }
 
-// maskKey shows "sk-gemini-XXXX...YYYY" for banner. Empty stays empty.
-func maskKey(k string) string {
-	if k == "" {
-		return "(disabled)"
-	}
-	if len(k) <= 12 {
-		return "****"
-	}
-	return k[:12] + "..." + k[len(k)-4:]
-}
-
 // Run 是进程入口，由根目录的 main.go 调用。
 func Run() {
 	port := flag.Int("port", 0, "listening port (default: 8083 or config.json)")
@@ -37,7 +30,7 @@ func Run() {
 	proxy := flag.String("proxy", "", "HTTP proxy fallback when proxy pool is empty")
 	impersonate := flag.String("impersonate", "", "TLS profile (chrome_146, chrome_133, firefox_147, ...)")
 	dbPath := flag.String("db", "", "SQLite path (default: ./data/gemini.db)")
-	adminToken := flag.String("admin-token", "", "admin token (empty = no auth, only safe on 127.0.0.1)")
+	adminToken := flag.String("admin-token", "", "admin token (empty = admin access disabled)")
 	apiKey := flag.String("api-key", "", "API key for /v1/* (locked). Empty = use kv-table key (auto-gen on first boot, mutable from admin UI)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -79,7 +72,7 @@ func Run() {
 	loadProxies()
 	seedProxiesFromConfig() // --proxy / 遗留静态代理并进代理池
 	seedCookiesFromConfig() // --cookie-file / 遗留单 cookie 并进 cookie 池
-	resolvedAPIKey := initAPIKey(*apiKey)
+	initAPIKey(*apiKey)
 	initTokenizer()
 	startScheduler()
 
@@ -178,10 +171,9 @@ func Run() {
 	fmt.Printf("gemini-web2api-go v%s\n", Version)
 	fmt.Printf("  Listening:   http://%s\n", addr)
 	fmt.Printf("  Base URL:    http://localhost:%d/v1\n", cfg.Port)
-	fmt.Printf("  API key:     %s%s\n", maskKey(resolvedAPIKey),
-		map[bool]string{true: "  (locked by flag/env)", false: "  (mutable in admin UI)"}[apiKeyLocked])
+	fmt.Printf("  API key:     %s\n", map[bool]string{true: "locked by flag/env", false: "managed in admin UI"}[apiKeyLocked])
 	if cfg.AdminEnabled {
-		authMode := "no auth (open)"
+		authMode := "disabled: configure ADMIN_TOKEN"
 		if cfg.AdminToken != "" {
 			authMode = "token auth"
 		}
@@ -203,9 +195,42 @@ func Run() {
 	fmt.Println()
 	warnEnvProxyIgnored()
 
-	if err := server.ListenAndServe(); err != nil {
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err := serveUntilStopped(stopCtx, server)
+	logCtx, cancelLogs := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancelLogs()
+	if !requestLogQueue().stop(logCtx) {
+		fmt.Fprintln(os.Stderr, "[request-log] drain deadline exceeded; some telemetry may have been lost")
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// serveUntilStopped drains active HTTP requests first. Only after it returns
+// should the caller close the request-log queue.
+func serveUntilStopped(stop context.Context, server *http.Server) error {
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	select {
+	case err := <-done:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-stop.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+			fmt.Fprintln(os.Stderr, "[http] graceful drain deadline exceeded; remaining connections closed")
+		}
+		if err := <-done; !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
 	}
 }
 

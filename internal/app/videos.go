@@ -67,7 +67,13 @@ func putVideoJob(j *videoJob) {
 func getVideoJob(id string) *videoJob {
 	videoJobsMu.Lock()
 	defer videoJobsMu.Unlock()
-	return videoJobs[id]
+	j := videoJobs[id]
+	if j == nil {
+		return nil
+	}
+	// Return an immutable response snapshot, never a worker-owned mutable job.
+	snapshot := *j
+	return &snapshot
 }
 
 // handleCreateVideo 处理 POST /v1/videos。
@@ -166,9 +172,10 @@ func startVideoJob(model, prompt, size string, images []pendingUpload) *videoJob
 		CreatedAt: time.Now().Unix(),
 		Prompt:    prompt,
 	}
+	snapshot := *j
 	putVideoJob(j)
 	go runVideoJob(j, images)
-	return j
+	return &snapshot
 }
 
 // videoSize maps OpenAI's `size` ("1280x720"/"720x1280") or an `aspect_ratio`
@@ -384,9 +391,10 @@ func handleExtendVideo(w http.ResponseWriter, r *http.Request, parentID string) 
 		RemixedFrom: parentID,
 		turn:        turn + 1,
 	}
+	snapshot := *j
 	putVideoJob(j)
 	go runVideoJobWith(j, images, acct, &ConvRef{CID: cid, RID: rid, RCID: rcid, Turn: turn + 1})
-	writeJSON(w, 200, j)
+	writeJSON(w, 200, &snapshot)
 }
 
 // mp4Duration reads mvhd (movie header) duration; 0 if not found.

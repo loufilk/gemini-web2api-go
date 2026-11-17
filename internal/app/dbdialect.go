@@ -45,7 +45,7 @@ func detectDSN(dsn string) (dbDialect, string, string) {
 		return dialectMySQL, "mysql", ensureMySQLParams(dsn) // go-sql-driver 原生 DSN
 	default:
 		fmt.Fprintf(os.Stderr, "[db] SQL_DSN 认不出方言（要 postgres:// 或 postgresql:// 或 mysql:// 开头，"+
-			"或 go-sql-driver 的 user:pass@tcp(host:port)/db 形式）: %s\n", dsn)
+			"或 go-sql-driver 的 user:pass@tcp(host:port)/db 形式）\n")
 		os.Exit(1)
 		return dialectSQLite, "", ""
 	}
@@ -55,7 +55,7 @@ func detectDSN(dsn string) (dbDialect, string, string) {
 func mysqlURLToDSN(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[db] mysql DSN 解析失败: %v\n", err)
+		fmt.Fprintln(os.Stderr, "[db] mysql DSN 解析失败，请检查格式")
 		os.Exit(1)
 	}
 	cred := ""

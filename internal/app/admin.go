@@ -27,21 +27,15 @@ func newSessionToken() string {
 // authOK accepts either:
 //  1. Cookie gemini_admin_session matching a valid sessions row
 //  2. Authorization: Bearer <admin_token>
-//  3. ?token=<admin_token> query param (for embedded HTML <a href> use)
 func authOK(r *http.Request) bool {
-	if cfg.AdminToken == "" {
-		return true // unauthenticated mode (only safe behind 127.0.0.1)
+	if strings.TrimSpace(cfg.AdminToken) == "" {
+		return false // Fail closed, including requests forwarded by a local reverse proxy.
 	}
 	if c, err := r.Cookie(sessionCookieName); err == nil && validSession(c.Value) {
 		return true
 	}
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		if subtle.ConstantTimeCompare([]byte(h[7:]), []byte(cfg.AdminToken)) == 1 {
-			return true
-		}
-	}
-	if t := r.URL.Query().Get("token"); t != "" {
-		if subtle.ConstantTimeCompare([]byte(t), []byte(cfg.AdminToken)) == 1 {
 			return true
 		}
 	}
@@ -59,7 +53,16 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if strings.TrimSpace(cfg.AdminToken) == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "admin authentication is not configured"})
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": "bad body"})
 		return
@@ -71,7 +74,7 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "bad json"})
 		return
 	}
-	if cfg.AdminToken != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(cfg.AdminToken)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(cfg.AdminToken)) != 1 {
 		writeJSON(w, 401, map[string]string{"error": "invalid token"})
 		return
 	}
@@ -83,6 +86,7 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   int(sessionTTL.Seconds()),
 		HttpOnly: true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, 200, map[string]bool{"ok": true})
@@ -96,9 +100,21 @@ func handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// Bound scans and avoid integer overflow in the requested time window.
+func boundedStatsHours(raw string) int {
+	hours := atoiDefault(raw, 24)
+	if hours < 1 {
+		return 1
+	}
+	if hours > 30*24 {
+		return 30 * 24
+	}
+	return hours
+}
+
 // /admin/api/stats — KPI summary for last N hours (default 24).
 func handleAdminStats(w http.ResponseWriter, r *http.Request) {
-	hours := atoiDefault(r.URL.Query().Get("hours"), 24)
+	hours := boundedStatsHours(r.URL.Query().Get("hours"))
 	since := time.Now().Unix() - int64(hours)*3600
 
 	stats := map[string]interface{}{}
@@ -211,6 +227,7 @@ func handleAdminTimeseries(w http.ResponseWriter, r *http.Request) {
 		Close() error
 		Next() bool
 		Scan(...interface{}) error
+		Err() error
 	}
 	if bucketSec == 86400 {
 		// pull from stats_daily
@@ -218,7 +235,7 @@ func handleAdminTimeseries(w http.ResponseWriter, r *http.Request) {
             SUM(prompt_tokens), SUM(output_tokens)
             FROM stats_daily WHERE bucket >= ? GROUP BY bucket ORDER BY bucket`, since)
 		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			writeJSON(w, 500, map[string]string{"error": "timeseries query failed"})
 			return
 		}
 		rows = r2
@@ -228,7 +245,7 @@ func handleAdminTimeseries(w http.ResponseWriter, r *http.Request) {
             SUM(prompt_tokens), SUM(output_tokens)
             FROM stats_hourly WHERE bucket >= ? GROUP BY bucket ORDER BY bucket`, since)
 		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			writeJSON(w, 500, map[string]string{"error": "timeseries query failed"})
 			return
 		}
 		rows = r2
@@ -241,7 +258,7 @@ func handleAdminTimeseries(w http.ResponseWriter, r *http.Request) {
             COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(output_tokens),0)
             FROM requests WHERE ts >= ? GROUP BY b ORDER BY b`, since)
 		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			writeJSON(w, 500, map[string]string{"error": "timeseries query failed"})
 			return
 		}
 		rows = r2
@@ -254,19 +271,41 @@ func handleAdminTimeseries(w http.ResponseWriter, r *http.Request) {
 		var requests, successes int
 		var p50, p95 float64
 		var pt, ot int64
-		if err := rows.Scan(&bucket, &requests, &successes, &p50, &p95, &pt, &ot); err == nil {
+		if err := rows.Scan(&bucket, &requests, &successes, &p50, &p95, &pt, &ot); err != nil {
+			writeJSON(w, 500, map[string]string{"error": "timeseries decode failed"})
+			return
+		} else {
 			series = append(series, map[string]interface{}{
 				"bucket":        bucket,
 				"requests":      requests,
 				"successes":     successes,
-				"p50_ms":        int(p50),
-				"p95_ms":        int(p95),
+				"p50_ms":        percentileDisplayValue(rng, p50),
+				"p95_ms":        percentileDisplayValue(rng, p95),
 				"prompt_tokens": pt,
 				"output_tokens": ot,
 			})
 		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"range": rng, "bucket_sec": bucketSec, "series": series})
+	if err := rows.Err(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "timeseries query failed"})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"range": rng, "bucket_sec": bucketSec, "percentile_method": percentileMethod(rng), "series": series})
+}
+
+// Aggregated percentile averages are not population percentiles. Raw 24h
+// summaries do not compute them at all; null avoids displaying fictitious zeroes.
+func percentileMethod(rng string) string {
+	if rng == "7d" || rng == "30d" {
+		return "mean_of_bucket_percentiles"
+	}
+	return "unavailable"
+}
+func percentileDisplayValue(rng string, value float64) interface{} {
+	if percentileMethod(rng) == "unavailable" {
+		return nil
+	}
+	return int(value)
 }
 
 // /admin/api/requests?limit=50&offset=0&model=...&status=...

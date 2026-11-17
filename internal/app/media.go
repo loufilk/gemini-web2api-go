@@ -2,11 +2,11 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -135,16 +135,32 @@ func filterDownloadCookies(cookie string) string {
 // mistaken for this one. Returns the turn's response-candidate id (rcid) as well,
 // which is needed to continue the conversation again.
 func fetchMediaArtifacts(tool int, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, string, error) {
+	return fetchMediaArtifactsContext(context.Background(), tool, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
+}
+
+func fetchMediaArtifactsContext(ctx context.Context, tool int, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, string, error) {
+	budget := 2 * time.Minute
+	if tool == toolVideo {
+		budget = 8 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	if tool == toolImage {
 		// 放大（#62）失败一律退回原来的下载，不重新生成。
 		if rtCfg().ImageUpscale && xsrf != "" {
-			arts, err := fetchUpscaledImages(raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
+			arts, err := fetchUpscaledImagesContext(ctx, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
 			if err == nil && len(arts) > 0 {
 				return arts, "", nil
 			}
-			logf("[upscale] 放大失败，改下原图: %v", err)
+			if ctx.Err() != nil {
+				return nil, "", ctx.Err()
+			}
+			logf("[upscale] 放大失败，改下原图")
 		}
-		arts, err := fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
+		arts, err := fetchImageArtifactsContext(ctx, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
 		return arts, "", err
 	}
 	// 音乐几乎立刻就绪，视频要生成几十秒到几分钟，所以视频轮询给足预算。
@@ -152,7 +168,7 @@ func fetchMediaArtifacts(tool int, raw, cid, rid, cookie, sapisid, xsrf, proxyUR
 	if tool == toolVideo {
 		maxPolls, interval = 45, 8*time.Second // 约 6 分钟
 	}
-	arts, rcid, err := fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, tool, maxPolls, interval, authuser)
+	arts, rcid, err := fetchDownloadArtifactsContext(ctx, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, tool, maxPolls, interval, authuser)
 	if err != nil {
 		return arts, rcid, err
 	}
@@ -240,6 +256,9 @@ func mp4InProtobuf(b []byte, depth int) []byte {
 		for s := uint(0); i < len(b) && s < 64; s += 7 {
 			c := b[i]
 			i++
+			if s == 63 && c > 1 {
+				return 0, i, false
+			}
 			v |= uint64(c&0x7f) << s
 			if c < 0x80 {
 				return v, i, true
@@ -264,7 +283,7 @@ func mp4InProtobuf(b []byte, depth int) []byte {
 			i += 4
 		case 2:
 			n, next, ok := varint(i)
-			if !ok || next+int(n) > len(b) || int(n) < 0 {
+			if !ok || next > len(b) || n > uint64(len(b)-next) {
 				return nil
 			}
 			p := b[next : next+int(n)]
@@ -287,16 +306,25 @@ func mp4InProtobuf(b []byte, depth int) []byte {
 // fetchImageArtifacts 取回生成的图片。链在 StreamGenerate 响应里就有，抠不到再退回轮询
 // hNvQHb。下载走 mediaGetFollow（跟随 302 并每跳重发 cookie）。
 func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, error) {
+	return fetchImageArtifactsContext(context.Background(), raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
+}
+
+func fetchImageArtifactsContext(ctx context.Context, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	urls := collectImageURLs(raw)
 	if len(urls) == 0 {
 		for i := 0; i < 6; i++ {
-			if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL, authuser); err == nil {
+			if body, err := pollHistoryRawContext(ctx, cid, cookie, sapisid, xsrf, proxyURL, authuser); err == nil {
 				if u := collectImageURLs(body); len(u) > 0 {
 					urls = u
 					break
 				}
 			}
-			time.Sleep(2 * time.Second)
+			if err := waitMediaContext(ctx, 2*time.Second); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if len(urls) == 0 {
@@ -304,7 +332,7 @@ func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime 
 	}
 	var arts []MediaArtifact
 	for _, u := range urls {
-		mime, data, err := downloadBytes(imageFullResURL(u), cookie, proxyURL, defaultMime, authuser)
+		mime, data, err := downloadBytesContext(ctx, imageFullResURL(u), cookie, proxyURL, defaultMime, authuser)
 		if err != nil {
 			return arts, err
 		}
@@ -340,19 +368,29 @@ func imageFullResURL(u string) string {
 // gg-dl（lh3）和 temp_data 那两种链是预览用的，只有 response_data 那条能下到真字节。
 func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, tool int,
 	maxPolls int, interval time.Duration, authuser int) ([]MediaArtifact, string, error) {
+	return fetchDownloadArtifactsContext(context.Background(), cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, tool, maxPolls, interval, authuser)
+}
+
+func fetchDownloadArtifactsContext(ctx context.Context, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, tool int,
+	maxPolls int, interval time.Duration, authuser int) ([]MediaArtifact, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	if cid == "" {
 		return nil, "", fmt.Errorf("没拿到会话 id，无法定位产物")
 	}
 	var dlURLs []string
 	rcid := ""
 	for i := 0; i < maxPolls; i++ {
-		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL, authuser); err == nil {
+		if body, err := pollHistoryRawContext(ctx, cid, cookie, sapisid, xsrf, proxyURL, authuser); err == nil {
 			if rid != "" && tool == toolVideo {
 				// Only this request's turn; skip polls where it hasn't shown up yet.
 				// Video only: the turn layout was verified on video histories, music wasn't.
 				scoped, ok := historyTurn(body, rid)
 				if !ok {
-					time.Sleep(interval)
+					if err := waitMediaContext(ctx, interval); err != nil {
+						return nil, rcid, err
+					}
 					continue
 				}
 				body = scoped
@@ -391,7 +429,9 @@ func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMi
 				return nil, rcid, &videoQuotaError{ResetAt: reset}
 			}
 		}
-		time.Sleep(interval)
+		if err := waitMediaContext(ctx, interval); err != nil {
+			return nil, rcid, err
+		}
 	}
 	if len(dlURLs) == 0 {
 		return nil, rcid, fmt.Errorf("hNvQHb 里没等到可下载的产物链接（response_data）")
@@ -406,7 +446,7 @@ func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMi
 			}
 			u += sep + "filename=artifact&opi=" + downloadOPI
 		}
-		mime, data, err := downloadBytes(u, cookie, proxyURL, defaultMime, authuser)
+		mime, data, err := downloadBytesContext(ctx, u, cookie, proxyURL, defaultMime, authuser)
 		if err != nil {
 			return arts, rcid, err
 		}
@@ -505,6 +545,13 @@ func turnReplyText(body string) (string, bool) {
 
 // pollHistoryRaw 调一次 hNvQHb 取会话历史，返回原始响应体。
 func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (string, error) {
+	return pollHistoryRawContext(context.Background(), cid, cookie, sapisid, xsrf, proxyURL, authuser)
+}
+
+func pollHistoryRawContext(ctx context.Context, cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	inner, _ := json.Marshal([]interface{}{cid, 10, nil, 1, []interface{}{0}, []interface{}{4}, nil, 1})
 	freq, _ := json.Marshal([]interface{}{[]interface{}{[]interface{}{"hNvQHb", string(inner), nil, "generic"}}})
 	form := url.Values{}
@@ -522,7 +569,7 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (
 	setAuthUserHeaders(headers, authuser)
 	delete(headers, "x-goog-ext-525001261-jspb")
 
-	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
+	status, _, body, err := googleRPCPostContext(ctx, endpoint, headers, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -672,6 +719,13 @@ func downloadIsResponseData(rawURL string) bool {
 // downloadBytes GET 一条产物链，跟随重定向并每跳重发 cookie 子集，返回 content-type
 // 和原始字节。图片链（会 302）和 contribution 链（单次 200）都走这个。
 func downloadBytes(rawURL, cookie, proxyURL, defaultMime string, authuser int) (string, []byte, error) {
+	return downloadBytesContext(context.Background(), rawURL, cookie, proxyURL, defaultMime, authuser)
+}
+
+func downloadBytesContext(ctx context.Context, rawURL, cookie, proxyURL, defaultMime string, authuser int) (string, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
 	rawURL = withAuthUserQuery(rawURL, authuser)
 	headers := map[string]string{
 		"Cookie":  filterDownloadCookies(cookie),
@@ -679,7 +733,7 @@ func downloadBytes(rawURL, cookie, proxyURL, defaultMime string, authuser int) (
 		"Referer": "https://gemini.google.com/",
 		"Accept":  "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
 	}
-	status, respHead, body, err := mediaGetFollow(rawURL, headers, proxyURL)
+	status, respHead, body, err := mediaGetFollowContext(ctx, rawURL, headers, proxyURL)
 	if err != nil {
 		return "", nil, err
 	}
@@ -702,9 +756,18 @@ func downloadBytes(rawURL, cookie, proxyURL, defaultMime string, authuser int) (
 // http 客户端出于安全默认不把 Cookie 头带到新域，于是重定向目标拿不到 cookie 就 403。
 // 手动跟随、每跳重发 cookie 才能过。两个 client 本来也都配了「不自动跟随」。
 func mediaGetFollow(rawURL string, headers map[string]string, proxyURL string) (int, map[string]string, []byte, error) {
+	return mediaGetFollowContext(context.Background(), rawURL, headers, proxyURL)
+}
+
+func mediaGetFollowContext(ctx context.Context, rawURL string, headers map[string]string, proxyURL string) (int, map[string]string, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, mediaIOTimeout)
+	defer cancel()
 	cur := rawURL
 	for hop := 0; hop < 6; hop++ {
-		status, respHead, body, err := mediaGetOnce(cur, headers, proxyURL)
+		status, respHead, body, err := mediaGetOnceContext(ctx, cur, headers, proxyURL)
 		if err != nil {
 			return status, respHead, body, err
 		}
@@ -741,8 +804,17 @@ func resolveRef(base, ref string) (string, error) {
 // mediaGetOnce 发一次 GET，不跟随重定向，响应头一起带回（要取 content-type / location）。
 // 有代理走 stdlib，没代理走 tls-client，跟 doGeminiRequest / uploadPost 一个规矩。
 func mediaGetOnce(rawURL string, headers map[string]string, proxyURL string) (int, map[string]string, []byte, error) {
+	return mediaGetOnceContext(context.Background(), rawURL, headers, proxyURL)
+}
+
+func mediaGetOnceContext(ctx context.Context, rawURL string, headers map[string]string, proxyURL string) (int, map[string]string, []byte, error) {
+	if err := trustedMediaURL(rawURL, false); err != nil {
+		return 0, nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, mediaIOTimeout)
+	defer cancel()
 	if proxyURL != "" {
-		req, err := http.NewRequest("GET", rawURL, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -752,13 +824,13 @@ func mediaGetOnce(rawURL string, headers map[string]string, proxyURL string) (in
 		}
 		resp, err := getStdlibClient(proxyURL).Do(req)
 		if err != nil {
-			return 0, nil, nil, err
+			return 0, nil, nil, mediaTransportError(ctx)
 		}
 		defer resp.Body.Close()
-		b, err := io.ReadAll(resp.Body)
+		b, err := readMediaBody(resp.Body, maxArtifactBytes)
 		return resp.StatusCode, flattenHeaders(resp.Header), b, err
 	}
-	req, err := fhttp.NewRequest("GET", rawURL, nil)
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -767,10 +839,10 @@ func mediaGetOnce(rawURL string, headers map[string]string, proxyURL string) (in
 	}
 	resp, err := getTLSClient().Do(req)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, mediaTransportError(ctx)
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	b, err := readMediaBody(resp.Body, maxArtifactBytes)
 	return resp.StatusCode, flattenFHeaders(resp.Header), b, err
 }
 

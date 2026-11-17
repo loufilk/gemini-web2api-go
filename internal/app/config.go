@@ -42,7 +42,7 @@ type Config struct {
 	GeminiBLAuto bool `json:"gemini_bl_auto"`
 	// 单次请求 prompt 的 UTF-8 字节上限，0 = 不限。
 	MaxPromptBytes int `json:"max_prompt_bytes"`
-	// 是否走 Gemini 原生 conversation_id 服务端多轮。默认 false，见 conversation.go。
+	// Deprecated: 仅用于兼容旧配置，不再按历史共享上游会话。
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果是否自动删掉 gemini.google.com 上留下的这条会话（#19，rpc GzXR5e）。
 	// 只登录态生效（删除要 XSRF）；异步 best-effort，删失败只记日志不影响响应。默认 false。
@@ -52,14 +52,14 @@ type Config struct {
 	AnonFirst bool `json:"anon_first"`
 	// 临时对话（#34）：发请求时塞 inner[45]=1，走 Gemini 网页端原生「临时对话」——
 	// 会话不进账号的会话列表、不用于训练，天然取代 auto_delete_conversation（无需再发删除
-	// RPC）。只登录态有意义（匿名本就不落账号）。与 multi_turn 冲突：multi_turn 开着时不发，
+	// RPC）。只登录态有意义（匿名本就不落账号）。
 	// 见 temporaryChatEligible。默认 false。
 	TemporaryChat bool `json:"temporary_chat"`
 	// 生成图放大（#62）：出图后照网页「下载原图」那样发 rpc c8o8Fe，返回放大版（实测宽高各
 	// 2 倍、JPEG）。要登录态；放大失败退回原来那张，不重新生成。默认 false。
 	ImageUpscale bool `json:"image_upscale"`
 	// 新协议（#43）：对话改走 processSession（WebChannel）而不是老的 StreamGenerate。后端是同一个，
-	// 只换传输层；老端点还能用，默认 false。多轮续接仍走老端点，见 webchannel.go。
+	// 只换传输层；老端点还能用，默认 false，见 webchannel.go。
 	WebChannel bool `json:"web_channel"`
 	// FirefoxFingerprint 是「浏览器指纹」实验开关（#40 之上）：开 → 强制走 Firefox/Zen 指纹
 	// （TLS profile Firefox_147 + Firefox UA + 去掉 Chromium 专有的 Sec-CH-UA）；关 → 用

@@ -139,9 +139,15 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
 					if args == "" {
 						args = "{}"
 					}
+					nameJSON, _ := json.Marshal(name)
+					idField := ""
+					if id := getStr(tcMap, "id"); id != "" {
+						idJSON, _ := json.Marshal(id)
+						idField = ", \"call_id\": " + string(idJSON)
+					}
 					tcStrs = append(tcStrs, fmt.Sprintf(
-						"```tool_call\n{\"name\": \"%s\", \"arguments\": %s}\n```",
-						name, args,
+						"```tool_call\n{\"name\": %s%s, \"arguments\": %s}\n```",
+						nameJSON, idField, args,
 					))
 				}
 				parts = append(parts, "[Assistant]: "+content+"\n"+strings.Join(tcStrs, "\n"))
@@ -149,7 +155,11 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
 				parts = append(parts, "[Assistant]: "+content)
 			}
 		case "tool":
-			parts = append(parts, formatToolResult(getStr(msg, "name"), content))
+			label := getStr(msg, "name")
+			if id := getStr(msg, "tool_call_id"); id != "" {
+				label += " (call_id=" + id + ")"
+			}
+			parts = append(parts, formatToolResult(label, content))
 		default:
 			if content != "" {
 				parts = append(parts, content)
@@ -524,6 +534,10 @@ func parseToolChoice(tc interface{}) (string, string) {
 			return v, ""
 		}
 	case map[string]interface{}:
+		// Responses API uses a flat function selector.
+		if getStr(v, "type") == "function" && getStr(v, "name") != "" {
+			return "required", getStr(v, "name")
+		}
 		// {"type":"function","function":{"name":"..."}}
 		if f, ok := v["function"].(map[string]interface{}); ok {
 			if n := getStr(f, "name"); n != "" {

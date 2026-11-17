@@ -116,7 +116,7 @@
 
 ```bash
 chmod +x gemini-web2api-go_*
-./gemini-web2api-go_* --port 8083 --admin-token your-admin-token
+./gemini-web2api-go_* --port 8083 --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN first}"
 ```
 
 数据默认落在 `./data/gemini.db`，换位置加 `--db /your/path.db`。
@@ -138,7 +138,7 @@ SQL_DSN="postgres://user:pass@host:5432/dbname?sslmode=disable"
 docker run -d --name gemini-web2api \
   -p 127.0.0.1:8083:8083 \
   -v "$PWD/data:/data" \
-  -e ADMIN_TOKEN=your-admin-token \
+  -e ADMIN_TOKEN="${ADMIN_TOKEN:?set ADMIN_TOKEN first}" \
   ghcr.io/zexadev/gemini-web2api-go:latest
 ```
 
@@ -146,7 +146,7 @@ docker run -d --name gemini-web2api \
 
 ```bash
 curl -O https://raw.githubusercontent.com/zexadev/gemini-web2api-go/main/docker-compose.yml
-ADMIN_TOKEN=your-admin-token docker compose up -d
+ADMIN_TOKEN="${ADMIN_TOKEN:?set ADMIN_TOKEN first}" docker compose up -d
 ```
 
 ### 从源码跑
@@ -157,7 +157,7 @@ ADMIN_TOKEN=your-admin-token docker compose up -d
 git clone https://github.com/zexadev/gemini-web2api-go
 cd gemini-web2api-go
 go build -o gemini-web2api-go .
-./gemini-web2api-go --port 8083 --admin-token your-admin-token
+./gemini-web2api-go --port 8083 --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN first}"
 ```
 
 改了代码想用容器跑，把 `docker-compose.yml` 里 `build:` 那两行的注释去掉，再 `docker compose up -d --build`。
@@ -440,8 +440,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 约 3-4.5MB）；**普通号**拿不到放大，但拿到的是没被重新压缩的原始文件（尺寸不变，约 0.8MB，
 默认那张约 0.2MB）。每张图多一次请求，返回体积大几倍。取不到就退回默认那张，不会重新生成。
 
-**多轮上下文默认是把 `messages` 拼成单个 prompt 发的**（打开「设置」里的服务端多轮续接
-`multi_turn` 后，认出是续接就只发最新一句、历史留在服务端，见[配置](#配置)）。拼接的代价是每轮重发全部历史，于是撞上
+**多轮上下文会把客户端提交的 `messages` 拼成单个 prompt。** 每轮都需要发送完整历史。旧的按历史前缀自动续接已停用，避免不同调用方误用同一网页会话。因此长对话会遇到
 单次输入的长度墙：**约 13 万 UTF-8 字节**，超了上游**从尾部静默截断且不报错**——而最新
 消息拼在末尾，被吃掉的正是你刚问的那句，表现像"模型突然变笨"。
 
@@ -464,7 +463,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 默认模型 | 客户端没传 `model` 时用哪个 |
 | 每 slot 并发 / RPM / RPH | 限流额度，0 = 不限 |
 | Prompt 字节上限 | 超了：挂 cookie 时转成文本附件发（可用长度到约 16 万字节），没挂时返回 400 `context_length_exceeded`。都不静默截断。按 UTF-8 字节算（上游的墙跟 token 无关），默认 128000。0 = 不限 |
-| 多轮（`multi_turn`） | 默认关。开启后走 Gemini 原生 conversation_id 服务端续接——客户端每轮重发全历史，服务端识别续接后只发最新一句、历史留服务端，长会话不再撞单请求字节墙。登录/匿名都可用。**注意**：不放大模型上下文窗口，超窗的早期内容仍会被挤出，解决的是"长对话不撞墙 + 保住最近上下文"，不是"喂超长文档"。 |
+| 多轮（`multi_turn`） | 旧配置兼容字段，已无效。请每次提交完整历史，不会复用上游会话。 |
 | 自动删会话（`auto_delete_conversation`） | 默认关。开启后每次出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录账号里堆一堆。只登录态生效，异步 best-effort、删失败不影响响应。 |
 | 临时对话（`temporary_chat`） | 默认关。开启后走 Gemini 网页端原生「临时对话」：会话压根不进账号的会话列表、不用于模型训练，比「自动删会话」更干净，还省掉那次删除请求。只登录态有意义；开了「服务端多轮续接」时自动不生效（临时对话不留列表，多轮要靠服务端留会话）。 |
 | 生图下载原图/放大（`image_upscale`） | 默认关。开启后照网页「下载」按钮取生成的图：Ultra 号放大到宽高各 2 倍，普通号拿到未重新压缩的原始文件。每张图多一次请求；取不到就退回默认那张。见上文「生图 / 音乐」。 |
@@ -527,7 +526,7 @@ Cookie 池（按 URL、cookie 内容去重），之后一律从面板管理。�
 | `--port` | 监听端口，默认 8083 |
 | `--config` | 指定 `config.json` 路径 |
 | `--db` | SQLite 路径，默认 `./data/gemini.db` |
-| `--admin-token` | 面板登录 token，留空 = 面板不鉴权（只有绑 127.0.0.1 才可接受） |
+| `--admin-token` | 面板登录 token，留空 = 禁止管理访问；必须设置 token |
 | `--api-key` | 锁定 `/v1/*` 的 key（面板改不了），等价于 `API_KEY` 环境变量 |
 | `--cookie-file` | 启动时把文件里的 cookie 导入 Cookie 池 |
 | `--proxy` | 启动时把这个代理导入代理池 |
@@ -712,7 +711,7 @@ internal/app/              全部实现
   client.go                tls-client (chrome146) + stdlib (走代理) 双 client
   gemini.go                模型表 + 80 槽 payload + 模型 header + StreamGenerate + wrb.fr 解析
   webchannel.go            新协议 processSession（WebChannel）传输，开关 web_channel
-  conversation.go          服务端多轮续接（multi_turn）：按历史前缀认续接，只发最新一句
+  conversation.go          提取上游会话 ID（用于清理本次请求会话）
   media.go                 生图 / 音乐 / 画布 / 视频：工具位 + 产物抽取与下载
   image_upscale.go         生图下载原图/放大（rpc c8o8Fe，开关 image_upscale）
   search.go                联网搜索引用来源抽取
@@ -775,7 +774,7 @@ docker-compose.yml         单容器，默认拉 ghcr 镜像，sqlite 挂 volume
 | 挂了 cookie 后请求全部 502 | cookie 已失效，取不到 XSRF token | 重新导出 cookie。判据：请求 `gemini-3.1-pro` 若回报 3.5 Flash-Lite 就是失效了 |
 | cookie 大约半小时就失效，保活没用 | Chrome 设备绑定会话，`__Secure-1PSIDTS` 换发 401 | 用 **Firefox** 重新登录再导出；点面板「保活」应能看到刷新了 `__Secure-1PSIDTS` |
 | 付费号的 cookie，付费模型却回报 3.5 Flash-Lite，「检测」显示登录态有效 | 浏览器里登了多个 Google 号，订阅不在默认号上，请求落到了默认号 | 在 Cookie 池给这条填「账号序号」（那个号的 Gemini 地址栏 `/u/1/` 就填 1），见上文 |
-| 面板打不开 / 401 | `--admin-token`（或 `ADMIN_TOKEN`）没对上 | token 留空则不鉴权，只有绑 127.0.0.1 时才可接受 |
+| 面板打不开 / 401 | `--admin-token`（或 `ADMIN_TOKEN`）没对上 | token 留空将禁止管理访问，请设置 `ADMIN_TOKEN` |
 
 Docker 用默认 bridge 网络时上游可能返回空内容（Google 拒绝某些 NAT 段）。本项目**没有复现过**，真遇到可以试 `network_mode: host` 验证是不是这个原因。
 
@@ -813,8 +812,7 @@ Docker 用默认 bridge 网络时上游可能返回空内容（Google 拒绝某�
 
 ### 为什么每发一条消息，gemini.google.com 里就多出一个会话？
 
-默认每个请求是独立会话。在面板「设置」勾选**服务端多轮续接**（`multi_turn`）后，同一串连续对话会复用同一个网页会话，
-只发最新一句、历史留在服务端。不想让网页端堆会话有两种办法：勾**临时对话**（`temporary_chat`）让会话压根不进列表（更干净、不入训练、不用删，推荐），
+每个请求均为独立会话，不会根据相同历史复用上游会话。不想让网页端堆会话有两种办法：勾**临时对话**（`temporary_chat`）让会话压根不进列表（更干净、不入训练、不用删，推荐），
 或勾**自动删网页会话**（`auto_delete_conversation`）出完结果再删掉。两者都只对登录号有意义。
 
 ### 能当 Cursor / Dify / WorkBuddy 这类 agent 工具的后端吗？
@@ -866,3 +864,7 @@ MIT — 详见 [LICENSE](LICENSE)
 
 [![LinuxDo](https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LinuxDo-blue?style=for-the-badge)](https://linux.do/)
 
+
+### 管理令牌升级注意
+
+管理令牌为空时，管理 API 拒绝访问，API 网关仍正常工作。Compose 不再提供共享默认令牌。先运行 `export ADMIN_TOKEN="$(openssl rand -hex 32)"` 生成随机令牌；实际部署请安全保存（例如受保护的环境配置），再通过 `ADMIN_TOKEN` 传入，以便后续登录和重启复用。不要使用文档占位符作为密码，也不要将令牌提交到 Git。

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -140,8 +141,15 @@ func upscaleDownloadURL(u string) string {
 // downloadUpscaled 下载放大图。带 alr=yes 的链不回 302，而是回 200 text/plain、正文是下一跳
 // 地址（浏览器抓包：lh3 → work.fife → lh3，前两跳都是这样），照着正文往下跳直到拿到图。
 func downloadUpscaled(u, cookie, proxyURL, defaultMime string, authuser int) (string, []byte, error) {
+	return downloadUpscaledContext(context.Background(), u, cookie, proxyURL, defaultMime, authuser)
+}
+
+func downloadUpscaledContext(ctx context.Context, u, cookie, proxyURL, defaultMime string, authuser int) (string, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
 	for hop := 0; hop < 5; hop++ {
-		mime, data, err := downloadBytes(u, cookie, proxyURL, defaultMime, authuser)
+		mime, data, err := downloadBytesContext(ctx, u, cookie, proxyURL, defaultMime, authuser)
 		if err != nil {
 			return "", nil, err
 		}
@@ -157,6 +165,13 @@ func downloadUpscaled(u, cookie, proxyURL, defaultMime string, authuser int) (st
 
 // requestUpscale 发一次 c8o8Fe，返回放大图的下载链。
 func requestUpscale(params, cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (string, error) {
+	return requestUpscaleContext(context.Background(), params, cid, cookie, sapisid, xsrf, proxyURL, authuser)
+}
+
+func requestUpscaleContext(ctx context.Context, params, cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	freq, _ := json.Marshal([]interface{}{[]interface{}{[]interface{}{"c8o8Fe", params, nil, "generic"}}})
 	form := url.Values{}
 	form.Set("f.req", string(freq))
@@ -171,12 +186,12 @@ func requestUpscale(params, cid, cookie, sapisid, xsrf, proxyURL string, authuse
 	headers := buildGeminiHeaders(cookie, sapisid, "")
 	setAuthUserHeaders(headers, authuser)
 	delete(headers, "x-goog-ext-525001261-jspb")
-	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
+	status, _, body, err := googleRPCPostContext(ctx, endpoint, headers, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		return "", err
 	}
 	if status != 200 {
-		return "", fmt.Errorf("c8o8Fe HTTP %d: %s", status, truncate(string(body), 160))
+		return "", fmt.Errorf("c8o8Fe HTTP %d", status)
 	}
 	// 回的链两种都见过：浏览器抓包里是 gg-dl/，纯 HTTP 实测是 gg/。
 	urls := walkFramesForURLs(string(body), func(s string) bool {
@@ -184,7 +199,7 @@ func requestUpscale(params, cid, cookie, sapisid, xsrf, proxyURL string, authuse
 			strings.Contains(s, "lh3.googleusercontent.com/gg/")
 	})
 	if len(urls) == 0 {
-		return "", fmt.Errorf("c8o8Fe 响应里没有下载链: %s", truncate(string(body), 160))
+		return "", fmt.Errorf("c8o8Fe 响应里没有下载链")
 	}
 	return urls[0], nil
 }
@@ -192,6 +207,13 @@ func requestUpscale(params, cid, cookie, sapisid, xsrf, proxyURL string, authuse
 // fetchUpscaledImages 对响应里每张生成图请求放大并下载。任何一张失败就整体返回错误，
 // 由调用方退回原来的下载方式（不重新生成）。
 func fetchUpscaledImages(raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, error) {
+	return fetchUpscaledImagesContext(context.Background(), raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
+}
+
+func fetchUpscaledImagesContext(ctx context.Context, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if cid == "" || rid == "" || xsrf == "" {
 		return nil, fmt.Errorf("缺会话 id / 回复 id / XSRF，无法请求放大")
 	}
@@ -202,7 +224,7 @@ func fetchUpscaledImages(raw, cid, rid, cookie, sapisid, xsrf, proxyURL, default
 	}
 	if len(blocks) == 0 {
 		// 流式响应里没带信息块时，从会话历史里找。
-		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL, authuser); err == nil {
+		if body, err := pollHistoryRawContext(ctx, cid, cookie, sapisid, xsrf, proxyURL, authuser); err == nil {
 			if scoped, ok := historyTurn(body, rid); ok {
 				body = scoped
 			}
@@ -224,11 +246,11 @@ func fetchUpscaledImages(raw, cid, rid, cookie, sapisid, xsrf, proxyURL, default
 		if err != nil {
 			return nil, err
 		}
-		dl, err := requestUpscale(params, cid, cookie, sapisid, xsrf, proxyURL, authuser)
+		dl, err := requestUpscaleContext(ctx, params, cid, cookie, sapisid, xsrf, proxyURL, authuser)
 		if err != nil {
 			return nil, err
 		}
-		mime, data, err := downloadUpscaled(upscaleDownloadURL(dl), cookie, proxyURL, defaultMime, authuser)
+		mime, data, err := downloadUpscaledContext(ctx, upscaleDownloadURL(dl), cookie, proxyURL, defaultMime, authuser)
 		if err != nil {
 			return nil, err
 		}
