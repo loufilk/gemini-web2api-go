@@ -272,10 +272,16 @@ func handleAdminTimeseries(w http.ResponseWriter, r *http.Request) {
 // /admin/api/requests?limit=50&offset=0&model=...&status=...
 func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 	limit := atoiDefault(r.URL.Query().Get("limit"), 50)
+	if limit < 1 {
+		limit = 1
+	}
 	if limit > 500 {
 		limit = 500
 	}
 	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
+	if offset < 0 {
+		offset = 0
+	}
 	model := r.URL.Query().Get("model")
 	status := r.URL.Query().Get("status")
 
@@ -284,7 +290,7 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
         status, COALESCE(error,''), COALESCE(ttfb_ms,0), total_ms,
         prompt_chars, response_chars, prompt_tokens, output_tokens,
         COALESCE(endpoint,''), stream, COALESCE(requested_model,''), COALESCE(canonical_model,''),
-        COALESCE(actual_model,''), COALESCE(actual_model_verified,0), COALESCE(retry_count,0), COALESCE(failure_class,'') FROM requests WHERE 1=1`
+        COALESCE(actual_model,''), COALESCE(actual_model_verified,0), COALESCE(retry_count,0), COALESCE(failure_class,''), catalog_ms, upstream_first_text_ms, model_verified_ms, downstream_first_text_ms, first_tool_ms, first_reasoning_ms, generation_start_ms, first_heartbeat_ms, prompt_bytes, prompt_budget_bytes, context_attachment_used, prepare_ms FROM requests WHERE 1=1`
 	args := []interface{}{}
 	if model != "" {
 		q += " AND model=?"
@@ -310,14 +316,26 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 		var id, ts, proxyID, acctID, ttfb, totalMs int64
 		var model, upstreamModel, proxyName, acctLabel, errStr, endpoint string
 		var requestedModel, canonicalModel, actualModel, failureClass string
+		var promptBytes, promptBudgetBytes, prepareMs *int64
+		var contextAttachmentUsed *bool
 		var verified, retryCount int
+		var CatalogMs *int64
+		var UpstreamFirstTextMs *int64
+		var ModelVerifiedMs *int64
+		var DownstreamFirstTextMs *int64
+		var FirstToolMs *int64
+		var FirstReasoningMs *int64
+		var GenerationStartMs *int64
+		var FirstHeartbeatMs *int64
+
 		var status, promptC, respC, promptT, outT, stream int
 		if err := rows.Scan(&id, &ts, &model, &upstreamModel, &proxyID, &proxyName,
 			&acctID, &acctLabel,
 			&status, &errStr, &ttfb, &totalMs,
 			&promptC, &respC, &promptT, &outT,
-			&endpoint, &stream, &requestedModel, &canonicalModel, &actualModel, &verified, &retryCount, &failureClass); err != nil {
-			continue
+			&endpoint, &stream, &requestedModel, &canonicalModel, &actualModel, &verified, &retryCount, &failureClass, &CatalogMs, &UpstreamFirstTextMs, &ModelVerifiedMs, &DownstreamFirstTextMs, &FirstToolMs, &FirstReasoningMs, &GenerationStartMs, &FirstHeartbeatMs, &promptBytes, &promptBudgetBytes, &contextAttachmentUsed, &prepareMs); err != nil {
+			writeJSON(w, 500, map[string]string{"error": "failed to read request logs"})
+			return
 		}
 		list = append(list, map[string]interface{}{
 			"id":              id,
@@ -327,6 +345,16 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 			"requested_model": requestedModel, "canonical_model": canonicalModel,
 			"actual_model": actualModel, "actual_model_verified": verified == 1,
 			"retry_count": retryCount, "failure_class": failureClass,
+			"prompt_bytes": promptBytes, "prompt_budget_bytes": promptBudgetBytes, "context_attachment_used": contextAttachmentUsed, "prepare_ms": prepareMs,
+			"catalog_ms":               CatalogMs,
+			"upstream_first_text_ms":   UpstreamFirstTextMs,
+			"model_verified_ms":        ModelVerifiedMs,
+			"downstream_first_text_ms": DownstreamFirstTextMs,
+			"first_tool_ms":            FirstToolMs,
+			"first_reasoning_ms":       FirstReasoningMs,
+			"generation_start_ms":      GenerationStartMs,
+			"first_heartbeat_ms":       FirstHeartbeatMs,
+
 			"proxy_id":       proxyID,
 			"proxy_name":     proxyName,
 			"account_id":     acctID,
@@ -344,6 +372,12 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	if err := rows.Err(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "failed to read request logs"})
+		return
+	}
+	rows.Close()
+
 	var total int
 	cq := "SELECT COUNT(*) FROM requests WHERE 1=1"
 	cargs := []interface{}{}
@@ -356,7 +390,10 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 	} else if status == "fail" {
 		cq += " AND status<>200"
 	}
-	_ = getDB().QueryRow(cq, cargs...).Scan(&total)
+	if err := getDB().QueryRow(cq, cargs...).Scan(&total); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "failed to count request logs"})
+		return
+	}
 
 	writeJSON(w, 200, map[string]interface{}{
 		"items":  list,

@@ -530,6 +530,7 @@ var runGeminiCall = func(g *geminiCall, onDelta, onReasoning func(string)) (stri
 }
 
 func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string) {
+	r = r.WithContext(withRequestLatency(r.Context()))
 	g, ok := prepareGemini(w, r, model)
 	if !ok {
 		return
@@ -543,14 +544,14 @@ func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string)
 			err = r.Context().Err()
 		}
 		status, code := generationFailure(err)
-		recordRequest("gemini.generateContent", g.modelName, g.prompt, "", res, status, code, false, g.requestedModel)
+		recordTimedRequest(r.Context(), "gemini.generateContent", g.modelName, g.prompt, "", res, status, code, false, g.requestedModel)
 		if status == 499 {
 			return
 		}
 		writeGeminiCallError(w, err)
 		return
 	}
-	recordRequest("gemini.generateContent", g.modelName, g.prompt, text, res, 200, "", false, g.requestedModel)
+	recordTimedRequest(r.Context(), "gemini.generateContent", g.modelName, g.prompt, text, res, 200, "", false, g.requestedModel)
 
 	t := newGeminiTurn(text, calls, res)
 	var parts []interface{}
@@ -669,6 +670,7 @@ func (s *geminiStream) end() {
 }
 
 func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model string) {
+	r = r.WithContext(withRequestLatency(r.Context()))
 	w, r, cancel := bindGenerationWriter(w, r)
 	defer cancel()
 	g, ok := prepareGemini(w, r, model)
@@ -682,16 +684,16 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 
 	// 带工具时正文过围栏闸门，跟 OpenAI 两条路一样：围栏原文不能推给客户端。
 	var gate *toolFenceGate
-	onDelta := st.text
+	onDelta := measureTextOutput(r.Context(), st.text)
 	if len(g.tools) > 0 {
-		gate = newToolFenceGate(st.text)
+		gate = newToolFenceGate(onDelta)
 		onDelta = gate.Push
 	}
 	var onReasoning func(string)
 	if includeThoughts {
 		onReasoning = st.thought
 	}
-	ka := startKeepalive(st.ping)
+	ka := startKeepalive(func() { st.ping(); markLatencyAfterWrite(r.Context(), latencyHeartbeat) })
 	defer ka.Stop()
 	onDelta, onReasoning = ka.guard(onDelta), ka.guard(onReasoning)
 
@@ -705,7 +707,7 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 			err = r.Context().Err()
 		}
 		status, code := generationFailure(err)
-		recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, "", res, status, code, true, g.requestedModel)
+		recordTimedRequest(r.Context(), "gemini.streamGenerateContent", g.modelName, g.prompt, "", res, status, code, true, g.requestedModel)
 		if status == 499 {
 			return
 		}
@@ -716,8 +718,6 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 		writeGeminiCallError(w, err)
 		return
 	}
-	recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, text, res, 200, "", true, g.requestedModel)
-
 	t := newGeminiTurn(text, calls, res)
 	// 补发真流式没推到的尾巴：思考在前、正文在后，保持「先思考后回答」的顺序。
 	if includeThoughts && res != nil && t.reasoning != "" {
@@ -726,8 +726,9 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 		}
 	}
 	var parts []interface{}
-	if rest := remainingOf(t.text, sentText(res, gate)); rest != "" {
-		parts = append(parts, map[string]interface{}{"text": rest})
+	restText := remainingOf(t.text, sentText(res, gate))
+	if restText != "" {
+		parts = append(parts, map[string]interface{}{"text": restText})
 	}
 	parts = append(parts, callParts(t.calls)...)
 	parts = append(parts, artifactParts(t.artifacts)...)
@@ -735,5 +736,13 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 		parts = append(parts, map[string]interface{}{"text": ""})
 	}
 	st.chunk(parts, "STOP", geminiUsage(g.prompt, t))
+	if restText != "" {
+		markLatencyAfterWrite(r.Context(), latencyDownstreamText)
+	}
+	if len(t.calls) > 0 {
+		markLatencyAfterWrite(r.Context(), latencyTool)
+	}
 	st.end()
+	status, code := completedWriteStatus(r.Context())
+	recordTimedRequest(r.Context(), "gemini.streamGenerateContent", g.modelName, g.prompt, text, res, status, code, true, g.requestedModel)
 }

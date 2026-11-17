@@ -616,6 +616,7 @@ func doWebChannelRequestContext(parent context.Context, r wcRequest, proxyURL st
 		case <-ctx.Done():
 			return generation.err(ctx.Err())
 		}
+		markRequestLatency(parent, latencySubmitted)
 		return post(1, ofs1)
 	}
 	ackTimer := time.NewTimer(wcAckWait)
@@ -651,7 +652,7 @@ func doWebChannelRequestContext(parent context.Context, r wcRequest, proxyURL st
 				}
 			}
 			if ev.Line != "" {
-				if generationLineHasContent(ev.Line) {
+				if noteGenerationContent(parent, ev.Line) {
 					generation.frame()
 				}
 				if ttfb < 0 {

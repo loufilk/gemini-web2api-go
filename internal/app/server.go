@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Version = "4.28.1+chuanapi.models2"
+const Version = "4.28.1+chuanapi.models2.latency1"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -191,6 +191,10 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 // Privacy: the prompt/response strings themselves are never persisted —
 // only their length, model name, latency, status, and proxy info.
 func recordRequest(endpoint, model, prompt, response string, res *StreamResult, status int, errStr string, stream bool, requested ...string) {
+	recordTimedRequest(nil, endpoint, model, prompt, response, res, status, errStr, stream, requested...)
+}
+
+func recordTimedRequest(ctx context.Context, endpoint, model, prompt, response string, res *StreamResult, status int, errStr string, stream bool, requested ...string) {
 	// 媒体产物是超长 base64，剥掉再算 token/长度：既不让它污染统计，也免得在请求线程里
 	// 对上百万字符跑 tiktoken 白白拖慢。
 	response = stripDataURLs(response)
@@ -245,6 +249,22 @@ func recordRequest(endpoint, model, prompt, response string, res *StreamResult, 
 			r.AccountLabel = fmt.Sprintf("#%d", res.AccountID)
 		}
 	}
+	if ctx != nil {
+		lat := snapshotRequestLatency(ctx)
+		r.CatalogMs = latencyBetweenMillis(lat.CatalogStart, lat.CatalogEnd)
+		r.PrepareMs = latencyBetweenMillis(lat.PrepareStart, lat.PrepareEnd)
+		r.GenerationStartMs = latencyMillis(lat.Submitted)
+		r.UpstreamFirstTextMs = latencyMillis(lat.UpstreamText)
+		r.FirstReasoningMs = latencyMillis(lat.Reasoning)
+		r.ModelVerifiedMs = latencyMillis(lat.ModelVerified)
+		r.DownstreamFirstTextMs = latencyMillis(lat.DownstreamText)
+		r.FirstToolMs = latencyMillis(lat.Tool)
+		r.FirstHeartbeatMs = latencyMillis(lat.Heartbeat)
+		r.PromptBytes = lat.PromptBytes
+		r.PromptBudgetBytes = lat.PromptBudgetBytes
+		r.ContextAttachmentUsed = lat.ContextAttachmentUsed
+	}
+
 	go insertRequest(r)
 }
 
@@ -260,6 +280,7 @@ var runOpenAIModel = func(messages []map[string]interface{}, prompt, latest stri
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withRequestLatency(r.Context()))
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": err.Error()}})
@@ -335,19 +356,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 直接转发会把围栏原文推给客户端，所以只放行确定不在围栏里的部分。
 	// 思考链跟围栏无关，两种情况都直接流。
 	var sse *sseWriter
+	var measuredText func(string)
 	var gate *toolFenceGate
 	var onDelta, onReasoning func(string)
 	var ka *streamKeepalive
 	if stream {
 		sse = newSSEWriter(w, cid, created, modelName)
 		onReasoning = sse.SendReasoning
+		measuredText = measureTextOutput(r.Context(), sse.SendContent)
 		if len(tools) == 0 {
-			onDelta = sse.SendContent
+			onDelta = measuredText
 		} else {
-			gate = newToolFenceGate(sse.SendContent)
+			gate = newToolFenceGate(measuredText)
 			onDelta = gate.Push
 		}
-		ka = startKeepalive(sse.Ping)
+		ka = startKeepalive(func() { sse.Ping(); markLatencyAfterWrite(r.Context(), latencyHeartbeat) })
 		defer ka.Stop()
 		onDelta, onReasoning = ka.guard(onDelta), ka.guard(onReasoning)
 	}
@@ -364,7 +387,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		mde, downgraded := err.(*ModelDowngradedError)
 		status, code := generationFailure(err)
-		recordRequest("chat.completions", modelName, prompt, "", res, status, code, stream, modelInput)
+		recordTimedRequest(r.Context(), "chat.completions", modelName, prompt, "", res, status, code, stream, modelInput)
 		if status == 499 {
 			return
 		}
@@ -421,7 +444,6 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		finish = "tool_calls"
 	}
 
-	recordRequest("chat.completions", modelName, prompt, text, res, 200, "", stream, modelInput)
 	if stream {
 		var usage map[string]int
 		if includeUsage {
@@ -437,15 +459,19 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 补尾巴要跟**实际发给客户端的内容**比。走了闸门时 res.Emitted 含围栏
 		// 原文，拿它比前缀会对不上，尾巴会整段丢掉。
 		if rest := remainingOf(text, sentText(res, gate)); rest != "" {
-			sse.SendContent(rest)
+			measuredText(rest)
 		}
 		if len(toolCalls) > 0 {
 			sse.SendToolCalls(toolCalls)
+			markLatencyAfterWrite(r.Context(), latencyTool)
 		}
 		sse.Finish(finish, usage)
+		status, code := completedWriteStatus(r.Context())
+		recordTimedRequest(r.Context(), "chat.completions", modelName, prompt, text, res, status, code, true, modelInput)
 		return
 	}
 
+	recordTimedRequest(r.Context(), "chat.completions", modelName, prompt, text, res, 200, "", false, modelInput)
 	writeJSON(w, 200, map[string]interface{}{
 		"id":      cid,
 		"object":  "chat.completion",
@@ -505,6 +531,7 @@ func remainingOf(full, emitted string) string {
 
 // handleResponses implements OpenAI's /v1/responses (Codex CLI format).
 func handleResponses(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withRequestLatency(r.Context()))
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": err.Error()}})
@@ -721,7 +748,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"part": map[string]interface{}{"type": "output_text", "text": "", "annotations": []interface{}{}},
 			})
 		}
-		emitDelta = func(d string) {
+		emitDelta = measureTextOutput(r.Context(), func(d string) {
 			startResponse()
 			ensureMsg()
 			writeEvent("response.output_text.delta", map[string]interface{}{
@@ -731,7 +758,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"content_index": 0,
 				"delta":         d,
 			})
-		}
+		})
 		// 跟 chat 那条路同一套围栏闸门：带 tools 时只放行确定不在围栏里的部分。
 		if len(tools) == 0 {
 			onDelta = emitDelta
@@ -747,6 +774,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				if flusher != nil {
 					flusher.Flush()
 				}
+				markLatencyAfterWrite(r.Context(), latencyHeartbeat)
 			})
 		}
 		defer ka.Stop()
@@ -767,7 +795,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		mde, downgraded := err.(*ModelDowngradedError)
 		status, code := generationFailure(err)
-		recordRequest("responses", modelName, prompt, "", res, status, code, stream, modelInput)
+		recordTimedRequest(r.Context(), "responses", modelName, prompt, "", res, status, code, stream, modelInput)
 		if status == 499 {
 			return
 		}
@@ -848,7 +876,6 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	recordRequest("responses", modelName, prompt, text, res, 200, "", stream, modelInput)
 	if stream {
 		// 补上闸门扣住、或前缀 diff 跳过的尾巴，再发终态事件。
 		if rest := remainingOf(text, sentText(res, gate)); rest != "" {
@@ -873,6 +900,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				writeEvent("response.output_item.done", map[string]interface{}{
 					"type": "response.output_item.done", "output_index": idx, "item": item,
 				})
+				markLatencyAfterWrite(r.Context(), latencyTool)
 			case "message":
 				ensureMsg() // 没有 delta 但有正文时，这里补声明 message item
 				if cps, ok := item["content"].([]map[string]interface{}); ok {
@@ -908,8 +936,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			"type":     "response.completed",
 			"response": respObj,
 		})
+		status, code := completedWriteStatus(r.Context())
+		recordTimedRequest(r.Context(), "responses", modelName, prompt, text, res, status, code, true, modelInput)
 		return
 	}
+
+	recordTimedRequest(r.Context(), "responses", modelName, prompt, text, res, 200, "", false, modelInput)
 
 	writeJSON(w, 200, map[string]interface{}{
 		"id":         rid,

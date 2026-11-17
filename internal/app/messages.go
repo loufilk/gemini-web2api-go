@@ -92,7 +92,9 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
 			})
 		}
 		if len(defs) > 0 {
-			defsJSON, _ := json.MarshalIndent(defs, "", "  ")
+			// Compact only schema syntax. String values, descriptions, and constraints
+			// remain intact; never truncate user instructions or tool results.
+			defsJSON, _ := json.Marshal(defs)
 			rule := "Only use tool_call blocks when needed."
 			switch {
 			case forced != "":

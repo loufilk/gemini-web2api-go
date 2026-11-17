@@ -686,7 +686,14 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
 	// 而且必须走跟正式请求同一个出口。
 	budget := rtCfg().MaxPromptBytes
-	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, authUser, proxyURL); ferr != nil {
+	noteRequestPrompt(ctx, len(prompt), budget)
+	markRequestLatency(ctx, latencyPrepareStart)
+	promptWithContext, extraFiles, attached, prepareErr := prepareContextFile(prompt, latest, budget, cookieStr, authUser, proxyURL)
+	markRequestLatency(ctx, latencyPrepareEnd)
+	if prepareErr == nil {
+		noteContextAttachment(ctx, attached)
+	}
+	if p, f, used, ferr := promptWithContext, extraFiles, attached, prepareErr; ferr != nil {
 		return attrib(ferr)
 	} else if used {
 		prompt = p
@@ -1111,8 +1118,9 @@ func doGeminiRequestContext(parent context.Context, endpoint, body string, heade
 	if parent.Err() != nil {
 		return 0, nil, 0, nil, parent.Err()
 	}
+	isGeneration, _ := parent.Value(generationLatencyKey{}).(bool)
 	callback := func(line string) error {
-		if generationLineHasContent(line) {
+		if (isGeneration && noteGenerationContent(parent, line)) || (!isGeneration && generationLineHasContent(line)) {
 			ctrl.frame()
 		}
 		if onLine != nil {
@@ -1132,6 +1140,9 @@ func doGeminiRequestContext(parent context.Context, endpoint, body string, heade
 			req.Header.Set(k, v)
 		}
 		client := getStdlibClient(proxyURL)
+		if isGeneration {
+			markRequestLatency(parent, latencySubmitted)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, 0, nil, ctrl.err(err)
@@ -1153,6 +1164,9 @@ func doGeminiRequestContext(parent context.Context, endpoint, body string, heade
 		req.Header.Set(k, v)
 	}
 	client := getTLSClient()
+	if isGeneration {
+		markRequestLatency(parent, latencySubmitted)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, 0, nil, ctrl.err(err)

@@ -27,7 +27,10 @@ func modelRequestContext(mc ModelConfig) context.Context {
 
 // Set phase budgets only for generation. Catalog and prepare calls use their
 // own bounded caller context. An explicit test/worker override is preserved.
+type generationLatencyKey struct{}
+
 func modelGenerationContext(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, generationLatencyKey{}, true)
 	if _, ok := ctx.Value(generationTimeoutsKey{}).(generationTimeouts); ok {
 		return ctx
 	}
@@ -96,6 +99,10 @@ func routeFromCatalog(cat AccountModelCatalog, mc ModelConfig) (ModelConfig, boo
 }
 
 func accountModelRoute(ctx context.Context, account *CookieAccount, proxy string, mc ModelConfig) (ModelConfig, error) {
+	return accountModelRouteBudget(ctx, account, proxy, mc, 8*time.Second)
+}
+
+func accountModelRouteBudget(ctx context.Context, account *CookieAccount, proxy string, mc ModelConfig, budget time.Duration) (ModelConfig, error) {
 	if !mc.RequireModelIdentity {
 		return mc, nil
 	}
@@ -105,11 +112,20 @@ func accountModelRoute(ctx context.Context, account *CookieAccount, proxy string
 	if account == nil || account.Status != "enabled" {
 		return mc, &ModelAvailabilityError{Code: "model_unavailable", Status: http.StatusNotFound}
 	}
-	fetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	fetchCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	markRequestLatency(ctx, latencyCatalogStart)
 	cat, err := discoverAccountModels(fetchCtx, account, proxy)
+	markRequestLatency(ctx, latencyCatalogEnd)
 	if ctx.Err() != nil {
 		return mc, ctx.Err()
+	}
+	// Only an internal deadline may fall back, never parent cancellation or
+	// an authoritative schema/auth rejection. cachedAccountModels enforces max age.
+	if err != nil && errors.Is(err, context.DeadlineExceeded) && fetchCtx.Err() == context.DeadlineExceeded {
+		if saved, ok := cachedAccountModels(account, proxy); ok {
+			cat, err = saved, nil
+		}
 	}
 	if err != nil {
 		return mc, &ModelAvailabilityError{Code: "model_catalog_unavailable", Status: http.StatusServiceUnavailable}

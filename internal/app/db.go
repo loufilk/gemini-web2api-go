@@ -42,6 +42,19 @@ CREATE TABLE IF NOT EXISTS requests (
     actual_model_verified INTEGER NOT NULL DEFAULT 0,
     retry_count INTEGER NOT NULL DEFAULT 0,
     failure_class TEXT,
+    prompt_bytes INTEGER,
+    prompt_budget_bytes INTEGER,
+    context_attachment_used INTEGER,
+    prepare_ms INTEGER,
+    catalog_ms INTEGER,
+    upstream_first_text_ms INTEGER,
+    model_verified_ms INTEGER,
+    downstream_first_text_ms INTEGER,
+    first_tool_ms INTEGER,
+    first_reasoning_ms INTEGER,
+    generation_start_ms INTEGER,
+    first_heartbeat_ms INTEGER,
+
     proxy_id        INTEGER,
     proxy_name      TEXT,
     account_id      INTEGER,
@@ -194,6 +207,20 @@ func getDB() *dbx {
 // Request rows ───────────────────────────────────────────────────────────────
 
 type RequestRow struct {
+	PromptBytes           *int64 `json:"prompt_bytes"`
+	PromptBudgetBytes     *int64 `json:"prompt_budget_bytes"`
+	ContextAttachmentUsed *bool  `json:"context_attachment_used"`
+	PrepareMs             *int64 `json:"prepare_ms"`
+	// Milestones are elapsed milliseconds; nil means not observed, zero is valid.
+	CatalogMs             *int64 `json:"catalog_ms"`
+	UpstreamFirstTextMs   *int64 `json:"upstream_first_text_ms"`
+	ModelVerifiedMs       *int64 `json:"model_verified_ms"`
+	DownstreamFirstTextMs *int64 `json:"downstream_first_text_ms"`
+	FirstToolMs           *int64 `json:"first_tool_ms"`
+	FirstReasoningMs      *int64 `json:"first_reasoning_ms"`
+	GenerationStartMs     *int64 `json:"generation_start_ms"`
+	FirstHeartbeatMs      *int64 `json:"first_heartbeat_ms"`
+
 	RequestedModel      string `json:"requested_model"`
 	CanonicalModel      string `json:"canonical_model"`
 	ActualModel         string `json:"actual_model"`
@@ -225,12 +252,12 @@ func insertRequest(r *RequestRow) {
         (ts, model, upstream_model, proxy_id, proxy_name, account_id, account_label,
          status, error, ttfb_ms, total_ms,
          prompt_chars, response_chars, prompt_tokens, output_tokens,
-         endpoint, stream, requested_model, canonical_model, actual_model, actual_model_verified, retry_count, failure_class)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         endpoint, stream, requested_model, canonical_model, actual_model, actual_model_verified, retry_count, failure_class, catalog_ms, upstream_first_text_ms, model_verified_ms, downstream_first_text_ms, first_tool_ms, first_reasoning_ms, generation_start_ms, first_heartbeat_ms, prompt_bytes, prompt_budget_bytes, context_attachment_used, prepare_ms)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.TS, r.Model, r.UpstreamModel, r.ProxyID, r.ProxyName, r.AccountID, r.AccountLabel,
 		r.Status, r.Error, r.TTFBMs, r.TotalMs,
 		r.PromptChars, r.ResponseChars, r.PromptTokens, r.OutputTokens,
-		r.Endpoint, r.Stream, r.RequestedModel, r.CanonicalModel, r.ActualModel, boolInt(r.ActualModelVerified), r.RetryCount, r.FailureClass)
+		r.Endpoint, r.Stream, r.RequestedModel, r.CanonicalModel, r.ActualModel, boolInt(r.ActualModelVerified), r.RetryCount, r.FailureClass, r.CatalogMs, r.UpstreamFirstTextMs, r.ModelVerifiedMs, r.DownstreamFirstTextMs, r.FirstToolMs, r.FirstReasoningMs, r.GenerationStartMs, r.FirstHeartbeatMs, r.PromptBytes, r.PromptBudgetBytes, nullableBoolInt(r.ContextAttachmentUsed), r.PrepareMs)
 	if err != nil {
 		logf("[db] insert request failed: %v", err)
 	}
@@ -300,6 +327,15 @@ func migrateRequestMetadata(conn *sql.DB) error {
 		{"requested_model", "TEXT"}, {"canonical_model", "TEXT"}, {"actual_model", "TEXT"},
 		{"actual_model_verified", "INTEGER NOT NULL DEFAULT 0"},
 		{"retry_count", "INTEGER NOT NULL DEFAULT 0"}, {"failure_class", "TEXT"},
+		{"catalog_ms", "BIGINT"},
+		{"upstream_first_text_ms", "BIGINT"},
+		{"model_verified_ms", "BIGINT"},
+		{"downstream_first_text_ms", "BIGINT"},
+		{"first_tool_ms", "BIGINT"},
+		{"first_reasoning_ms", "BIGINT"},
+		{"generation_start_ms", "BIGINT"},
+		{"first_heartbeat_ms", "BIGINT"},
+		{"prompt_bytes", "BIGINT"}, {"prompt_budget_bytes", "BIGINT"}, {"context_attachment_used", "INTEGER"}, {"prepare_ms", "BIGINT"},
 	} {
 		query := "SELECT " + c.name + " FROM requests LIMIT 0"
 		rows, err := conn.Query(query)
@@ -324,4 +360,11 @@ func boolInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func nullableBoolInt(v *bool) any {
+	if v == nil {
+		return nil
+	}
+	return boolInt(*v)
 }

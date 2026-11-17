@@ -487,6 +487,9 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 		logf("[conv] 续接命中 turn=%d，只发 %d 字节（历史留服务端）", conv.turn, len(prompt))
 	}
 
+	noteRequestPrompt(ctx, len(prompt), rtCfg().MaxPromptBytes)
+	noteContextAttachment(ctx, false)
+
 	// strict_model 换号只对新会话做：续接的会话绑死在原来的号上，降级了只记冷却、
 	// 报错作废这路会话，客户端重试时当新会话全量重发，自然挑到别的号。
 	exclude := map[int64]bool{}

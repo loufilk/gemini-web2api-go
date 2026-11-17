@@ -602,7 +602,7 @@ const pages = {
             <thead><tr>
               <th class="nw">时间</th><th class="nw">模型</th><th class="nw">实际模型</th>
               <th class="nw">出口</th><th class="nw">账号</th><th class="nw">状态</th>
-              <th class="nw">首字</th><th class="nw">总用时</th>
+              <th class="nw">上游首行</th><th class="nw">正文首字</th><th class="nw">首个工具</th><th class="nw">总用时</th>
               <th class="nw">输入</th><th class="nw">输出</th><th>接口</th>
             </tr></thead>
             <tbody><tr><td colspan="11" class="empty">加载中...</td></tr></tbody>
@@ -950,6 +950,8 @@ async function loadReqs() {
                      : '<span class="badge muted">' + t('匿名') + '</span>'}</td>
       <td class="nw">${r.status === 200 ? '<span class="badge ok">200</span>' : '<span class="badge fail">' + r.status + '</span>'}</td>
       <td class="num nw">${fmt.ms(r.ttfb_ms)}</td>
+      <td class="num nw" title="${escapeHtml(t('上游正文') + ': ' + fmt.ms(r.upstream_first_text_ms) + ' · ' + t('型号确认') + ': ' + fmt.ms(r.model_verified_ms))}">${fmt.ms(r.downstream_first_text_ms)}</td>
+      <td class="num nw">${fmt.ms(r.first_tool_ms)}</td>
       <td class="num nw">${fmt.ms(r.total_ms)}</td>
       <td class="num nw">${fmt.num(r.prompt_tokens)}</td>
       <td class="num nw">${fmt.num(r.output_tokens)}</td>
@@ -957,7 +959,7 @@ async function loadReqs() {
         ${r.error ? '<div class="pre clamp2" style="color:var(--fail);margin-top:4px" title="'
           + escapeHtml(t(r.error)) + '"><b>' + t('错误：') + '</b>' + escapeHtml(t(r.error)) + '</div>' : ''}
       </td>
-    </tr>`).join('') || '<tr><td colspan="11" class="empty">还没有请求记录</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="13" class="empty">还没有请求记录</td></tr>';
   const size = reqPageSize();
   const total = data.total || 0;
   const page = Math.floor(reqOffset / size) + 1;
@@ -2201,6 +2203,11 @@ const I18N_EN = {
   '账号': 'Account',
   '状态': 'Status',
   '首字': 'TTFB',
+  '上游首行': 'Upstream first line',
+  '上游正文': 'Upstream text',
+  '型号确认': 'Model confirmed',
+  '正文首字': 'First text',
+  '首个工具': 'First tool',
   '总用时': 'Total',
   '输入': 'Input',
   '输出': 'Output',

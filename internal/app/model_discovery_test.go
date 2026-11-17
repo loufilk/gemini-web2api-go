@@ -316,3 +316,128 @@ func TestAccountModelCatalogCanceledLeaderPreservesCache(t *testing.T) {
 		})
 	}
 }
+
+func TestCatalogXSRFRecoveryBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		recover bool
+		cancel  bool
+	}{
+		{"xsrf", 400, `[["er",null,400,["xsrf"]]]`, true, false},
+		{"ordinary400", 400, `bad request`, false, false},
+		{"forbidden", 403, `["xsrf"]`, false, false},
+		{"cancel", 400, `["xsrf"]`, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			a := &CookieAccount{ID: 1, Cookie: "synthetic", AuthUser: 2}
+			gets, posts, invalidates := 0, 0, 0
+			token := func(got context.Context, c string, u int, p string) (string, error) {
+				gets++
+				if got != ctx || c != a.Cookie || u != 2 || p != "egress" {
+					t.Fatal("context or account changed")
+				}
+				if gets == 1 {
+					return "old", nil
+				}
+				return "fresh", nil
+			}
+			invalidate := func(c string) {
+				invalidates++
+				if c != a.Cookie {
+					t.Fatal("wrong account invalidated")
+				}
+				if tc.cancel {
+					cancel()
+				}
+			}
+			post := func(got context.Context, tok string) (int, []byte, error) {
+				posts++
+				if got != ctx {
+					t.Fatal("detached context")
+				}
+				if posts == 1 {
+					if tok != "old" {
+						t.Fatal("wrong token")
+					}
+					return tc.status, []byte(tc.body), nil
+				}
+				if tok != "fresh" {
+					t.Fatal("stale token reused")
+				}
+				return 200, discoveryBody(discoveryFixture(true), "otAQ7b"), nil
+			}
+			_, err := fetchAccountModelsWithRPC(ctx, a, "egress", token, invalidate, post)
+			if tc.cancel {
+				if !errors.Is(err, context.Canceled) || posts != 1 || gets != 1 {
+					t.Fatal("cancellation retried", err, posts, gets)
+				}
+				return
+			}
+			if tc.recover {
+				if err != nil || posts != 2 || gets != 2 || invalidates != 1 {
+					t.Fatal("recovery failed", err, posts, gets, invalidates)
+				}
+			} else if err == nil || posts != 1 || gets != 1 || invalidates != 0 {
+				t.Fatal("unexpected recovery", err, posts, gets, invalidates)
+			}
+		})
+	}
+	// Repeated rejection must never become an unbounded retry.
+	n := 0
+	_, err := fetchAccountModelsWithRPC(context.Background(), &CookieAccount{Cookie: "synthetic"}, "", func(context.Context, string, int, string) (string, error) { return "t", nil }, func(string) {}, func(context.Context, string) (int, []byte, error) { n++; return 400, []byte(`["xsrf"]`), nil })
+	if err == nil || n != 2 {
+		t.Fatal("unbounded XSRF retry", n, err)
+	}
+}
+
+func TestCatalogRouteInternalDeadlineFallback(t *testing.T) {
+	// No parallel use: replace only the test cache's data/functions, not its mutex.
+	oldEntries, oldNow, oldFetch := liveModelCatalogs.entries, liveModelCatalogs.now, liveModelCatalogs.fetch
+	defer func() {
+		liveModelCatalogs.entries = oldEntries
+		liveModelCatalogs.now = oldNow
+		liveModelCatalogs.fetch = oldFetch
+	}()
+	now := time.Unix(100000, 0)
+	a := &CookieAccount{ID: 900, Cookie: "synthetic", Status: "enabled"}
+	cat, err := parseAccountModelCatalog(discoveryBody(discoveryFixture(true), "otAQ7b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := catalogAccountKey(a, "")
+	liveModelCatalogs.now = func() time.Time { return now }
+	liveModelCatalogs.fetch = func(ctx context.Context, _ *CookieAccount, _ string) (AccountModelCatalog, error) {
+		<-ctx.Done()
+		return AccountModelCatalog{}, ctx.Err()
+	}
+	mc := ModelConfig{Upstream: "4 Carbon", RequireModelIdentity: true}
+	for _, age := range []time.Duration{6 * time.Minute, 16 * time.Minute} {
+		cat.FetchedAt = now.Add(-age)
+		liveModelCatalogs.entries = map[string]*catalogCacheEntry{key: {catalog: cat}}
+		got, err := accountModelRouteBudget(context.Background(), a, "", mc, time.Millisecond)
+		if age < modelCatalogMaxAge {
+			if err != nil || got.HexID != "95a4c0abcba24364" {
+				t.Fatal("valid stale refused", err)
+			}
+		} else if err == nil {
+			t.Fatal("expired stale accepted")
+		}
+	}
+	cat.FetchedAt = now.Add(-6 * time.Minute)
+	liveModelCatalogs.entries = map[string]*catalogCacheEntry{key: {catalog: cat}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := accountModelRouteBudget(ctx, a, "", mc, time.Millisecond); !errors.Is(err, context.Canceled) {
+		t.Fatal("parent cancellation used stale", err)
+	}
+	liveModelCatalogs.fetch = func(context.Context, *CookieAccount, string) (AccountModelCatalog, error) {
+		return AccountModelCatalog{}, errModelCatalog
+	}
+	if _, err := accountModelRouteBudget(context.Background(), a, "", mc, time.Millisecond); err == nil {
+		t.Fatal("authoritative rejection used stale")
+	}
+}

@@ -231,42 +231,57 @@ func (c *accountCatalogCache) get(ctx context.Context, a *CookieAccount, proxy s
 // Discovery shares the selected account authentication, egress and cancellation.
 // No errors include upstream response bodies, cookies, or proxy credentials.
 func fetchAccountModels(ctx context.Context, a *CookieAccount, proxy string) (AccountModelCatalog, error) {
-	if err := ctx.Err(); err != nil {
-		return AccountModelCatalog{}, err
-	}
-	xsrf, err := getXSRFContext(ctx, a.Cookie, a.AuthUser, proxy)
-	if err != nil {
-		return AccountModelCatalog{}, errModelCatalog
-	}
-	if err := ctx.Err(); err != nil {
-		return AccountModelCatalog{}, err
-	}
-	req, _ := json.Marshal([]any{[]any{[]any{"otAQ7b", "[]", nil, "generic"}}})
-	form := url.Values{"f.req": {string(req)}, "at": {xsrf}}
-	ep := fmt.Sprintf("%s/_/BardChatUi/data/batchexecute?rpcids=otAQ7b&bl=%s&hl=en&_reqid=%d&rt=c", geminiBase(a.AuthUser), url.QueryEscape(currentBL(proxy)), time.Now().UnixNano()%1000000)
-	h := buildGeminiHeaders(a.Cookie, extractSAPISID(a.Cookie), "")
-	setAuthUserHeaders(h, a.AuthUser)
-	if err := ctx.Err(); err != nil {
-		return AccountModelCatalog{}, err
-	}
-	size := 0
-	status, body, _, _, err := doGeminiRequestContext(ctx, ep, form.Encode(), h, proxy, func(line string) error {
-		size += len(line)
-		if size > 2<<20 {
-			return errModelCatalog
-		}
-		return nil
+	return fetchAccountModelsWithRPC(ctx, a, proxy, getXSRFContext, invalidateXSRF, func(ctx context.Context, token string) (int, []byte, error) {
+		req, _ := json.Marshal([]any{[]any{[]any{"otAQ7b", "[]", nil, "generic"}}})
+		form := url.Values{"f.req": {string(req)}, "at": {token}}
+		ep := fmt.Sprintf("%s/_/BardChatUi/data/batchexecute?rpcids=otAQ7b&bl=%s&hl=en&_reqid=%d&rt=c", geminiBase(a.AuthUser), url.QueryEscape(currentBL(proxy)), time.Now().UnixNano()%1000000)
+		h := buildGeminiHeaders(a.Cookie, extractSAPISID(a.Cookie), "")
+		setAuthUserHeaders(h, a.AuthUser)
+		size := 0
+		status, body, _, _, err := doGeminiRequestContext(ctx, ep, form.Encode(), h, proxy, func(line string) error {
+			size += len(line)
+			if size > 2<<20 {
+				return errModelCatalog
+			}
+			return nil
+		})
+		return status, body, err
 	})
-	if err := ctx.Err(); err != nil {
-		return AccountModelCatalog{}, err
+}
+
+// Dependencies are explicit for offline tests; recovery is limited to this
+// read-only RPC, the same account/egress/context, and one proven XSRF rejection.
+func fetchAccountModelsWithRPC(ctx context.Context, a *CookieAccount, proxy string,
+	token func(context.Context, string, int, string) (string, error), invalidate func(string),
+	post func(context.Context, string) (int, []byte, error)) (AccountModelCatalog, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return AccountModelCatalog{}, err
+		}
+		xsrf, err := token(ctx, a.Cookie, a.AuthUser, proxy)
+		if ctx.Err() != nil {
+			return AccountModelCatalog{}, ctx.Err()
+		}
+		if err != nil {
+			return AccountModelCatalog{}, errModelCatalog
+		}
+		status, body, err := post(ctx, xsrf)
+		if ctx.Err() != nil {
+			return AccountModelCatalog{}, ctx.Err()
+		}
+		if err == nil && status == 400 && attempt == 0 && isXSRFError(string(body)) {
+			invalidate(a.Cookie)
+			continue
+		}
+		if err != nil || status == 429 || status >= 500 {
+			return AccountModelCatalog{}, errModelCatalogTransient
+		}
+		if status != 200 {
+			return AccountModelCatalog{}, errModelCatalog
+		}
+		return parseAccountModelCatalog(body)
 	}
-	if err != nil || status == 429 || status >= 500 {
-		return AccountModelCatalog{}, errModelCatalogTransient
-	}
-	if status != 200 {
-		return AccountModelCatalog{}, errModelCatalog
-	}
-	return parseAccountModelCatalog(body)
+	return AccountModelCatalog{}, errModelCatalog
 }
 
 var catalogHexRE = regexp.MustCompile(`^[0-9a-f]{16}$`)

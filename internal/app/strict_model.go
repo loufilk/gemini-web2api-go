@@ -287,6 +287,9 @@ func guardedModelEmitter(mc ModelConfig, emit func(string) error) func(string) e
 			if !modelReportMatches(mc, name) {
 				return &ModelIdentityError{Requested: mc.Upstream, Reported: name}
 			}
+			if !confirmed {
+				markRequestLatency(modelRequestContext(mc), latencyModelVerified)
+			}
 			confirmed = true
 		}
 		if deferred {
