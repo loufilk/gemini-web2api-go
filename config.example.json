@@ -9,6 +9,8 @@
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "first_frame_timeout_sec": 0,
+  "stream_idle_timeout_sec": 0,
   "retention_days": 30,
   "per_ip_concurrent": 5,
   "per_ip_rpm": 30,

@@ -354,7 +354,7 @@ Hydrogen 和 Carbon 是需要相应网页端权限的模型路由；有登录态
 | `gemini-canvas` | 画布，生成交互 HTML 文档（内联返回 ```html 块），**要配 cookie** |
 | `gemini-video` | 生视频（异步，几十秒~几分钟），产物 base64 MP4，**要 Pro/付费号**；免费号被上游内容政策拒 |
 
-这三条 4 系列路由不受 `strict_model` 开关影响。型号缺失或不符返回 502（`model_identity_unverified` 或 `model_identity_mismatch`），不会换号重放。流式请求等上游完成并核对后才发 SSE；其他模型保留原流式行为。Argon 不在模型列表中，直接调用只接受真实的 Argon 回报，绝不把 Carbon 当 Argon。
+这三条 4 系列路由和 3.1 Pro 不受 `strict_model` 开关影响。账号目录决定是否能选它，响应元数据决定是否成功；目录没有 Argon 的账号不会用 Carbon 冒充。流式内容等核对后再发，允许先保活，已开流后的错误用协议失败终态传递。见 [ChuanAPI 部署与回退说明](docs/chuanapi-model-rollout.md)。
 
 > Hydrogen 路由依据：[上游 issue #74](https://github.com/zexadev/gemini-web2api-go/issues/74) 与 [gemini-stealth-bridge 的模型注册测试](https://github.com/azrinaldi/gemini-stealth-bridge/blob/ace32031a4ba9576d9f1d913c996e03d9bb6d087/internal/gemini/registry_names_test.go#L35)。这是社区网页协议证据，尚未在本机使用真实账号验证。
 
@@ -472,7 +472,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 严格模型校验（`strict_model`） | 默认关。账号某一档额度用完时，上游不报错，而是静默换成更弱的模型照样回 200。开启后，服务端自报的模型跟请求的不一致就不把降级回答当成功：换下一个号重试，全池都被降级就回 `429 insufficient_quota`（`code: model_downgraded`，带 `Retry-After`）。流式在吐出第一个字之前就判断，不会先吐一半再报错。媒体模型（生图/音乐/视频/画布）不参与判断。 |
 | 降级冷却（`strict_model_cooldown_min`） | 配合严格模型校验：被降级的号在这个模型上歇多久再用，默认 300 分钟（网页端用量按 5 小时窗口算）。0 = 不记，每次请求都重新试。 |
 | 重试次数 / 重试间隔 / 上游超时 | |
-| 超时后重试（`retry_on_timeout`） | 默认开。关掉后上游等满「上游超时」还没回完就直接报错，不再按重试次数重发：重发多半还是超时，一个请求最坏要等「超时 × 重试次数」，超长输入或慢模型（如 Argon）下能拖十几分钟。空响应、出错话术等其他失败照常重试。 |
+| 生成超时 | `request_timeout_sec` 是总预算；可独立设首帧与空闲预算（见部署说明）。同步生成的执行结果不确定时不会自动重放；旧重试配置保留用于兼容。 |
 | 流式保活（`stream_keepalive_sec`） | 默认 0（关）。流式请求连续这么多秒没往客户端写东西，就发一次保活，防止前面的 nginx / Cloudflare / newapi 等中间层因连接空闲回 504。建议 15。OpenAI 两个接口发 SSE 注释行 `: ping`（客户端按规范忽略），`/v1beta` 发一块空正文（Google SDK 不认注释行）。**代价**：保活要先开流（HTTP 200），之后再失败只能在流里报错，拿不到 502/429 状态码，依赖状态码换渠道的客户端会受影响；秒级就失败的请求不受影响。非流式请求无效，只能调大中间层的超时。 |
 | 明细保留天数 | 过期只删明细，聚合数据永久保留 |
 | TLS 指纹 | `chrome_146`（默认）/ `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
@@ -825,7 +825,7 @@ Function calling 是 prompt 级实现，模型不一定每次都按格式返回�
 
 ### 旧 3.8 Flash、Hydrogen、Argon 和 Carbon 怎么选？
 
-旧 `gemini-3.7-flash` / `gemini-3.8-flash`（含 thinking）是 Hydrogen 的兼容别名；可以继续填写旧名，响应使用 Hydrogen 正名。若会员路由未切换、没有自报、或返回另一个型号，生成失败而不是改贴标签。Carbon 和 Argon 分别验身份，后者不在默认目录。网页权限和实际思考档应单独验收。
+旧 `gemini-3.7-flash` / `gemini-3.8-flash`（含 thinking）是 Hydrogen 的兼容别名；可以继续填写旧名，响应使用 Hydrogen 正名。若会员路由未切换、没有自报、或返回另一个型号，生成失败而不是改贴标签。Carbon 和 Argon 分别验身份；仅账户实时目录有独立 Argon 才会出现在可用列表。网页权限和实际思考档应单独验收。
 
 ### 生图用的是哪个模型？能出 2K 吗？
 

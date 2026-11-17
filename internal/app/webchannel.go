@@ -70,6 +70,7 @@ type wcRequest struct {
 	Cookie   string
 	SAPISID  string
 	AuthUser int
+	Capacity int
 }
 
 // wcStatusError 是服务端在下行帧里给的错误（{"__sm__":{"status":…}}）。
@@ -108,27 +109,42 @@ var (
 )
 
 func webChannelAPIKey(proxyURL string) (string, error) {
-	wcKeyMu.Lock()
-	defer wcKeyMu.Unlock()
-	if wcKey != "" && time.Since(wcKeyAt) < wcKeyTTL {
-		return wcKey, nil
+	return webChannelAPIKeyContext(context.Background(), proxyURL)
+}
+func webChannelAPIKeyContext(ctx context.Context, proxyURL string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	body, err := fetchAppPage("", 0, proxyURL)
+	wcKeyMu.Lock()
+	cached, fresh := wcKey, wcKey != "" && time.Since(wcKeyAt) < wcKeyTTL
+	wcKeyMu.Unlock()
+	if fresh {
+		return cached, nil
+	}
+	// Never hold the cache lock across network I/O: another caller's slow fetch
+	// must not prevent this caller from observing its own cancellation.
+	body, err := fetchAppPageContext(ctx, "", 0, proxyURL)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	if err != nil {
-		if wcKey != "" {
-			return wcKey, nil // 抓页失败先用旧的，key 很少变
+		if cached != "" {
+			return cached, nil
 		}
 		return "", fmt.Errorf("取 processSession API key: %w", err)
 	}
 	m := wcKeyRe.FindSubmatch(body)
 	if m == nil {
-		if wcKey != "" {
-			return wcKey, nil
+		if cached != "" {
+			return cached, nil
 		}
 		return "", errors.New("取 processSession API key: 页面里没有 d2zJAe")
 	}
-	wcKey, wcKeyAt = string(m[1]), time.Now()
-	return wcKey, nil
+	key := string(m[1])
+	wcKeyMu.Lock()
+	wcKey, wcKeyAt = key, time.Now()
+	wcKeyMu.Unlock()
+	return key, nil
 }
 
 // --- 请求头 ---
@@ -136,12 +152,19 @@ func webChannelAPIKey(proxyURL string) (string, error) {
 // wcModelHeaderBin 是 x-goog-ext-525001261-jspb 的 proto 版：JSPB 数组下标 n ↔ proto 字段 n+1。
 // 字段 1=1、5=hex、15=mode、16=think。跟老协议一样，服务端选模型认这个头不认 payload。
 func wcModelHeaderBin(hexID string, mode, think int) string {
+	return wcModelHeaderBinWithCapacity(hexID, mode, think, 0)
+}
+func wcModelHeaderBinWithCapacity(hexID string, mode, think, capacity int) string {
 	var b []byte
 	b = append(b, 0x08, 0x01)
 	if hexID != "" {
 		b = append(b, 0x2a)
 		b = appendVarint(b, uint64(len(hexID)))
 		b = append(b, hexID...)
+	}
+	if capacity > 0 {
+		b = append(b, 0x60)
+		b = appendVarint(b, uint64(capacity))
 	}
 	if mode > 0 {
 		b = append(b, 0x78) // 15<<3|0
@@ -169,7 +192,7 @@ func wcHTTPHeaders(apiKey string, r wcRequest) string {
 	var b strings.Builder
 	add := func(k, v string) { b.WriteString(k + ":" + v + "\r\n") }
 	add("X-Goog-Api-Key", apiKey)
-	add("x-goog-ext-525001261-bin", wcModelHeaderBin(r.HexID, r.Mode, r.Think))
+	add("x-goog-ext-525001261-bin", wcModelHeaderBinWithCapacity(r.HexID, r.Mode, r.Think, r.Capacity))
 	add("X-WebChannel-Content-Type", "application/json+protobuf")
 	if r.Cookie != "" && r.SAPISID != "" {
 		add("Authorization", makeSAPISIDHash(r.SAPISID))
@@ -406,17 +429,33 @@ func wcParseStatus(p json.RawMessage) *wcStatusError {
 // (HTTP 状态, 老格式的 raw, TTFB 毫秒, Set-Cookie, err)。下行错误按 wcStatusError.httpStatus
 // 映射成状态码，body 是错误文本，让上层的重试和 cookie 健康度逻辑原样生效。
 func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error) (int, []byte, int64, []string, error) {
+	return doWebChannelRequestContext(context.Background(), r, proxyURL, onLine)
+}
+
+func doWebChannelRequestContext(parent context.Context, r wcRequest, proxyURL string, onLine func(string) error) (status int, body []byte, firstByte int64, cookies []string, resultErr error) {
 	sendAt := time.Now()
-	apiKey, err := webChannelAPIKey(proxyURL)
-	if err != nil {
-		return 0, nil, 0, nil, err
-	}
 	timeout := time.Duration(rtCfg().RequestTimeout) * time.Second
 	if timeout <= 0 {
 		timeout = 300 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	generation := startGenerationContext(parent, timeout)
+	ctx := generation.ctx
+	defer generation.finish()
+	defer func() {
+		if resultErr != nil || ctx.Err() != nil {
+			resultErr = generation.err(resultErr)
+		}
+	}()
+	if ctx.Err() != nil {
+		return 0, nil, 0, nil, generation.err(ctx.Err())
+	}
+	apiKey, err := webChannelAPIKeyContext(ctx, proxyURL)
+	if ctx.Err() != nil {
+		return 0, nil, 0, nil, generation.err(ctx.Err())
+	}
+	if err != nil {
+		return 0, nil, 0, nil, err
+	}
 
 	var setCookie []string
 	var setCookieMu sync.Mutex
@@ -424,6 +463,12 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		setCookieMu.Lock()
 		setCookie = append(setCookie, sc...)
 		setCookieMu.Unlock()
+	}
+
+	cookieSnapshot := func() []string {
+		setCookieMu.Lock()
+		defer setCookieMu.Unlock()
+		return append([]string(nil), setCookie...)
 	}
 
 	// 1) 握手
@@ -436,10 +481,13 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		return 0, nil, 0, nil, err
 	}
 	keepCookies(hs.setCookie)
-	hsBody, _ := io.ReadAll(io.LimitReader(hs.body, 1<<20))
+	hsBody, readErr := io.ReadAll(io.LimitReader(hs.body, 1<<20))
 	hs.body.Close()
+	if readErr != nil {
+		return 0, nil, 0, cookieSnapshot(), readErr
+	}
 	if hs.status != 200 {
-		return hs.status, hsBody, 0, setCookie, nil
+		return hs.status, hsBody, 0, cookieSnapshot(), nil
 	}
 	var sid string
 	_ = wcReadFrames(strings.NewReader(string(hsBody)), func(it wcItem) bool {
@@ -452,7 +500,7 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	})
 	gsid := hs.sessionID
 	if sid == "" || gsid == "" {
-		return 502, []byte("processSession 握手没拿到会话: " + truncate(string(hsBody), 200)), 0, setCookie, nil
+		return 502, []byte("processSession 握手没拿到会话: " + truncate(string(hsBody), 200)), 0, cookieSnapshot(), nil
 	}
 	sess := fmt.Sprintf("gsessionid=%s&SID=%s", url.QueryEscape(gsid), url.QueryEscape(sid))
 
@@ -525,8 +573,11 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 			return err
 		}
 		keepCookies(resp.setCookie)
-		b, _ := io.ReadAll(io.LimitReader(resp.body, 4096))
+		b, readErr := io.ReadAll(io.LimitReader(resp.body, 4096))
 		resp.body.Close()
+		if readErr != nil {
+			return readErr
+		}
 		if resp.status != 200 {
 			return fmt.Errorf("processSession 上行 ofs=%d HTTP %d: %s", ofs, resp.status, truncate(string(b), 200))
 		}
@@ -541,12 +592,12 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	select {
 	case <-getReady:
 	case e := <-getErr:
-		return 0, nil, 0, setCookie, e
+		return 0, nil, 0, cookieSnapshot(), e
 	case <-ctx.Done():
-		return 0, nil, 0, setCookie, fmt.Errorf("processSession 下行没建立（%s）: %w", timeout, errUpstreamTimeout)
+		return 0, nil, 0, cookieSnapshot(), fmt.Errorf("processSession 下行没建立（%s）: %w", timeout, errUpstreamTimeout)
 	}
 	if err := post(0, ofs0); err != nil {
-		return 0, nil, 0, setCookie, err
+		return 0, nil, 0, cookieSnapshot(), err
 	}
 
 	// 4) 收下行，直到结束帧。正文（ofs=1）要等下行回了对 ofs=0 的确认（[[]]）再发：
@@ -558,7 +609,13 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	promptSent := false
 	sendPrompt := func() error {
 		promptSent = true
-		time.Sleep(wcPromptGap)
+		timer := time.NewTimer(wcPromptGap)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return generation.err(ctx.Err())
+		}
 		return post(1, ofs1)
 	}
 	ackTimer := time.NewTimer(wcAckWait)
@@ -568,7 +625,7 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		case <-ackTimer.C:
 			if !promptSent {
 				if err := sendPrompt(); err != nil {
-					return 0, nil, 0, setCookie, err
+					return 0, nil, 0, cookieSnapshot(), err
 				}
 			}
 			continue
@@ -576,24 +633,27 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 			if !ok {
 				select {
 				case e := <-getErr:
-					return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie, e
+					return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), cookieSnapshot(), e
 				default:
 				}
 				if ctx.Err() != nil {
-					return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie,
+					return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), cookieSnapshot(),
 						fmt.Errorf("processSession 超时（%s）: %w", timeout, errUpstreamTimeout)
 				}
-				return 200, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie, nil
+				return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), cookieSnapshot(), io.ErrUnexpectedEOF
 			}
 			if ev.Err != nil {
-				return ev.Err.httpStatus(), []byte(ev.Err.Error()), ttfbOr(ttfb, sendAt), setCookie, nil
+				return ev.Err.httpStatus(), []byte(ev.Err.Error()), ttfbOr(ttfb, sendAt), cookieSnapshot(), nil
 			}
 			if ev.Ack && !promptSent {
 				if err := sendPrompt(); err != nil {
-					return 0, nil, 0, setCookie, err
+					return 0, nil, 0, cookieSnapshot(), err
 				}
 			}
 			if ev.Line != "" {
+				if generationLineHasContent(ev.Line) {
+					generation.frame()
+				}
 				if ttfb < 0 {
 					ttfb = time.Since(sendAt).Milliseconds()
 				}
@@ -601,7 +661,7 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				raw.WriteByte('\n')
 				if onLine != nil {
 					if err := onLine(ev.Line); err != nil {
-						return 200, []byte(raw.String()), ttfb, setCookie, err
+						return 200, []byte(raw.String()), ttfb, cookieSnapshot(), err
 					}
 				}
 			}
@@ -611,10 +671,13 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				go func() { _ = post(2, ofs2) }()
 			}
 			if ev.End {
-				return 200, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie, nil
+				if !closing {
+					return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), cookieSnapshot(), errUpstreamIncomplete
+				}
+				return 200, []byte(raw.String()), ttfbOr(ttfb, sendAt), cookieSnapshot(), nil
 			}
 		case <-ctx.Done():
-			return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie,
+			return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), cookieSnapshot(),
 				fmt.Errorf("processSession 超时（%s）: %w", timeout, errUpstreamTimeout)
 		}
 	}

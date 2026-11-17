@@ -12,12 +12,13 @@ import (
 // header 是懒发的：第一次真要写 chunk 时才 WriteHeader(200)。这样上游在出第一个
 // 字之前就失败的话，还能退回正常的 502 JSON，而不是留给客户端半个流。
 type sseWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	id      string
-	created int64
-	model   string
-	started bool
+	w        http.ResponseWriter
+	flusher  http.Flusher
+	id       string
+	created  int64
+	model    string
+	started  bool
+	terminal bool
 }
 
 func newSSEWriter(w http.ResponseWriter, id string, created int64, model string) *sseWriter {
@@ -70,6 +71,9 @@ func (s *sseWriter) chunk(delta map[string]interface{}, finish interface{}, usag
 // SendReasoning 推思考链增量。上游先把思考链推完才开始推正文，所以客户端会
 // 先看到「思考过程」再看到答案，跟网页端的观感一致。
 func (s *sseWriter) SendReasoning(delta string) {
+	if s.terminal {
+		return
+	}
 	if delta == "" {
 		return
 	}
@@ -78,6 +82,9 @@ func (s *sseWriter) SendReasoning(delta string) {
 }
 
 func (s *sseWriter) SendContent(delta string) {
+	if s.terminal {
+		return
+	}
 	if delta == "" {
 		return
 	}
@@ -86,6 +93,9 @@ func (s *sseWriter) SendContent(delta string) {
 }
 
 func (s *sseWriter) SendToolCalls(tcs []ToolCall) {
+	if s.terminal {
+		return
+	}
 	s.start()
 	// 流式 delta 里每个 tool_call 必须带 index，客户端靠它把分片的 tool_call 拼起来
 	// （OpenAI 流式规范要求）。ToolCall 结构本身没有 index，这里按顺序补上。
@@ -106,6 +116,10 @@ func (s *sseWriter) SendToolCalls(tcs []ToolCall) {
 
 // Finish 收尾：空 delta + finish_reason，可选 usage chunk，最后 [DONE]。
 func (s *sseWriter) Finish(reason string, usage map[string]int) {
+	if s.terminal {
+		return
+	}
+	defer func() { s.terminal = true }()
 	s.start()
 	s.chunk(map[string]interface{}{}, reason, nil)
 	if usage != nil {
@@ -128,6 +142,10 @@ func (s *sseWriter) Finish(reason string, usage map[string]int) {
 // Fail 在已经开流之后出错时用：发一个带 error 的 chunk 再收尾。
 // 此时 HTTP 状态码已经是 200，改不了了。
 func (s *sseWriter) Fail(err error) {
+	if s.terminal {
+		return
+	}
+	defer func() { s.terminal = true }()
 	s.start()
 	c := map[string]interface{}{
 		"id": s.id, "object": "chat.completion.chunk",
@@ -137,7 +155,7 @@ func (s *sseWriter) Fail(err error) {
 	}
 	b, _ := json.Marshal(c)
 	fmt.Fprintf(s.w, "data: %s\n\n", b)
-	fmt.Fprintf(s.w, "data: [DONE]\n\n")
+
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
@@ -146,6 +164,9 @@ func (s *sseWriter) Fail(err error) {
 // Ping 发一行 SSE 注释（": ping"）保活，见 keepalive.go。按 SSE 规范冒号开头的行
 // 客户端一律忽略；还没开流时先开流（发响应头和 role chunk）。
 func (s *sseWriter) Ping() {
+	if s.terminal {
+		return
+	}
 	s.start()
 	fmt.Fprint(s.w, ": ping\n\n")
 	if s.flusher != nil {

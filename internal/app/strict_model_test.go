@@ -19,7 +19,7 @@ func setStrictModel(t *testing.T, on bool) {
 const downgradedLine = `[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"1+1等于2。\"]]],null,\"cf41b0e0dd7d53e5\",null,null,\"3.5 Flash-Lite\",true]"]]`
 
 func TestStrictLineCheck(t *testing.T) {
-	model := Models["gemini-3.1-pro"]
+	model := Models["gemini-3.6-flash"]
 
 	setStrictModel(t, false)
 	if strictLineCheck(model, func() int64 { return 7 }) != nil {

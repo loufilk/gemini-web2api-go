@@ -47,6 +47,9 @@ func TestHydrogenRouting(t *testing.T) {
 }
 
 func TestHydrogenCookieGateAndModelLists(t *testing.T) {
+	installCatalogFixture(t, func(*CookieAccount) AccountModelCatalog {
+		return AccountModelCatalog{Models: []DiscoveredModel{{CanonicalName: "gemini-4-hydrogen", HexID: hexHydrogen4, Mode: 1, ThinkingPolicyKnown: true, ThinkingModes: []int{1, 2}}}}
+	})
 	for _, signedIn := range []bool{false, true} {
 		label := "anonymous"
 		if signedIn {

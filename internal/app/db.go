@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS requests (
     ts              INTEGER NOT NULL,
     model           TEXT NOT NULL,
     upstream_model  TEXT,
+    requested_model TEXT,
+    canonical_model TEXT,
+    actual_model TEXT,
+    actual_model_verified INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    failure_class TEXT,
     proxy_id        INTEGER,
     proxy_name      TEXT,
     account_id      INTEGER,
@@ -174,6 +180,10 @@ func getDB() *dbx {
 		// authuser 列三种库的老库都要补：缺这一列时查账号的 SELECT 整条失败、池子直接空掉。
 		// 这句语法三种库通用，已有该列时报错忽略。
 		_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN authuser INTEGER NOT NULL DEFAULT 0`)
+		if err := migrateRequestMetadata(conn); err != nil {
+			fmt.Fprintf(os.Stderr, "[db] request metadata migration failed: %v\n", err)
+			os.Exit(1)
+		}
 		db = conn
 		dbw = &dbx{conn}
 		logf("[db] opened dialect=%d driver=%s", curDialect, driver)
@@ -184,24 +194,30 @@ func getDB() *dbx {
 // Request rows ───────────────────────────────────────────────────────────────
 
 type RequestRow struct {
-	ID            int64  `json:"id"`
-	TS            int64  `json:"ts"`
-	Model         string `json:"model"`
-	UpstreamModel string `json:"upstream_model"`
-	ProxyID       *int64 `json:"proxy_id"`
-	ProxyName     string `json:"proxy_name"`
-	AccountID     *int64 `json:"account_id"`
-	AccountLabel  string `json:"account_label"`
-	Status        int    `json:"status"`
-	Error         string `json:"error"`
-	TTFBMs        *int64 `json:"ttfb_ms"`
-	TotalMs       int64  `json:"total_ms"`
-	PromptChars   int    `json:"prompt_chars"`
-	ResponseChars int    `json:"response_chars"`
-	PromptTokens  int    `json:"prompt_tokens"`
-	OutputTokens  int    `json:"output_tokens"`
-	Endpoint      string `json:"endpoint"`
-	Stream        int    `json:"stream"`
+	RequestedModel      string `json:"requested_model"`
+	CanonicalModel      string `json:"canonical_model"`
+	ActualModel         string `json:"actual_model"`
+	ActualModelVerified bool   `json:"actual_model_verified"`
+	RetryCount          int    `json:"retry_count"`
+	FailureClass        string `json:"failure_class"`
+	ID                  int64  `json:"id"`
+	TS                  int64  `json:"ts"`
+	Model               string `json:"model"`
+	UpstreamModel       string `json:"upstream_model"`
+	ProxyID             *int64 `json:"proxy_id"`
+	ProxyName           string `json:"proxy_name"`
+	AccountID           *int64 `json:"account_id"`
+	AccountLabel        string `json:"account_label"`
+	Status              int    `json:"status"`
+	Error               string `json:"error"`
+	TTFBMs              *int64 `json:"ttfb_ms"`
+	TotalMs             int64  `json:"total_ms"`
+	PromptChars         int    `json:"prompt_chars"`
+	ResponseChars       int    `json:"response_chars"`
+	PromptTokens        int    `json:"prompt_tokens"`
+	OutputTokens        int    `json:"output_tokens"`
+	Endpoint            string `json:"endpoint"`
+	Stream              int    `json:"stream"`
 }
 
 func insertRequest(r *RequestRow) {
@@ -209,12 +225,12 @@ func insertRequest(r *RequestRow) {
         (ts, model, upstream_model, proxy_id, proxy_name, account_id, account_label,
          status, error, ttfb_ms, total_ms,
          prompt_chars, response_chars, prompt_tokens, output_tokens,
-         endpoint, stream)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         endpoint, stream, requested_model, canonical_model, actual_model, actual_model_verified, retry_count, failure_class)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.TS, r.Model, r.UpstreamModel, r.ProxyID, r.ProxyName, r.AccountID, r.AccountLabel,
 		r.Status, r.Error, r.TTFBMs, r.TotalMs,
 		r.PromptChars, r.ResponseChars, r.PromptTokens, r.OutputTokens,
-		r.Endpoint, r.Stream)
+		r.Endpoint, r.Stream, r.RequestedModel, r.CanonicalModel, r.ActualModel, boolInt(r.ActualModelVerified), r.RetryCount, r.FailureClass)
 	if err != nil {
 		logf("[db] insert request failed: %v", err)
 	}
@@ -273,4 +289,39 @@ func dbPermHint(dir string) string {
 		"        1) 改用具名卷（推荐）：volumes 写 gw2a-data:/data\n"+
 		"        2) 保留 bind mount 就把属主改过来：sudo chown -R 65532:65532 ./data\n",
 		uid, dir)
+}
+
+// migrateRequestMetadata is additive across SQLite, MySQL and Postgres. Probe
+// columns first, rather than swallowing every ALTER error (including outages).
+// Old rows intentionally retain unknown model identity; never backfill evidence.
+func migrateRequestMetadata(conn *sql.DB) error {
+	for _, c := range []struct{ name, kind string }{
+		{"upstream_model", "TEXT"}, {"account_id", "INTEGER"}, {"account_label", "TEXT"},
+		{"requested_model", "TEXT"}, {"canonical_model", "TEXT"}, {"actual_model", "TEXT"},
+		{"actual_model_verified", "INTEGER NOT NULL DEFAULT 0"},
+		{"retry_count", "INTEGER NOT NULL DEFAULT 0"}, {"failure_class", "TEXT"},
+	} {
+		query := "SELECT " + c.name + " FROM requests LIMIT 0"
+		rows, err := conn.Query(query)
+		if err == nil {
+			rows.Close()
+			continue
+		}
+		if _, err = conn.Exec("ALTER TABLE requests ADD COLUMN " + c.name + " " + c.kind); err != nil {
+			// Another instance may have completed the same migration meanwhile.
+			rows, probeErr := conn.Query(query)
+			if probeErr != nil {
+				return fmt.Errorf("add %s: %w", c.name, err)
+			}
+			rows.Close()
+		}
+	}
+	return nil
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }

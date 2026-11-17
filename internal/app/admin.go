@@ -283,7 +283,8 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
         COALESCE(account_id,0), COALESCE(account_label,''),
         status, COALESCE(error,''), COALESCE(ttfb_ms,0), total_ms,
         prompt_chars, response_chars, prompt_tokens, output_tokens,
-        COALESCE(endpoint,''), stream FROM requests WHERE 1=1`
+        COALESCE(endpoint,''), stream, COALESCE(requested_model,''), COALESCE(canonical_model,''),
+        COALESCE(actual_model,''), COALESCE(actual_model_verified,0), COALESCE(retry_count,0), COALESCE(failure_class,'') FROM requests WHERE 1=1`
 	args := []interface{}{}
 	if model != "" {
 		q += " AND model=?"
@@ -308,19 +309,24 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, ts, proxyID, acctID, ttfb, totalMs int64
 		var model, upstreamModel, proxyName, acctLabel, errStr, endpoint string
+		var requestedModel, canonicalModel, actualModel, failureClass string
+		var verified, retryCount int
 		var status, promptC, respC, promptT, outT, stream int
 		if err := rows.Scan(&id, &ts, &model, &upstreamModel, &proxyID, &proxyName,
 			&acctID, &acctLabel,
 			&status, &errStr, &ttfb, &totalMs,
 			&promptC, &respC, &promptT, &outT,
-			&endpoint, &stream); err != nil {
+			&endpoint, &stream, &requestedModel, &canonicalModel, &actualModel, &verified, &retryCount, &failureClass); err != nil {
 			continue
 		}
 		list = append(list, map[string]interface{}{
-			"id":             id,
-			"ts":             ts,
-			"model":          model,
-			"upstream_model": upstreamModel,
+			"id":              id,
+			"ts":              ts,
+			"model":           model,
+			"upstream_model":  upstreamModel,
+			"requested_model": requestedModel, "canonical_model": canonicalModel,
+			"actual_model": actualModel, "actual_model_verified": verified == 1,
+			"retry_count": retryCount, "failure_class": failureClass,
 			"proxy_id":       proxyID,
 			"proxy_name":     proxyName,
 			"account_id":     acctID,

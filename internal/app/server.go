@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +11,7 @@ import (
 	"time"
 )
 
-const Version = "4.28.1-chuanapi.1"
+const Version = "4.28.1+chuanapi.models2"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -22,7 +23,8 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	var data []map[string]interface{}
-	for name, c := range availableModels() {
+	models := catalogModels(r.Context())
+	for name, c := range models {
 		data = append(data, map[string]interface{}{
 			"id":          name,
 			"object":      "model",
@@ -188,13 +190,25 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 // recordRequest writes one row of metadata to the requests table.
 // Privacy: the prompt/response strings themselves are never persisted —
 // only their length, model name, latency, status, and proxy info.
-func recordRequest(endpoint, model, prompt, response string, res *StreamResult, status int, errStr string, stream bool) {
+func recordRequest(endpoint, model, prompt, response string, res *StreamResult, status int, errStr string, stream bool, requested ...string) {
 	// 媒体产物是超长 base64，剥掉再算 token/长度：既不让它污染统计，也免得在请求线程里
 	// 对上百万字符跑 tiktoken 白白拖慢。
 	response = stripDataURLs(response)
+	if errStr != "" {
+		if !safeFailureCode(errStr) {
+			errStr = "upstream_error"
+		}
+		if res != nil && res.FailureClass != "" {
+			errStr = res.FailureClass
+		}
+		if status == 499 {
+			errStr = "client_canceled"
+		}
+	}
 	r := &RequestRow{
-		TS:            time.Now().Unix(),
-		Model:         model,
+		TS:             time.Now().Unix(),
+		Model:          model,
+		RequestedModel: model, CanonicalModel: model, FailureClass: errStr,
 		Status:        status,
 		Error:         errStr,
 		PromptChars:   len(prompt),
@@ -203,11 +217,20 @@ func recordRequest(endpoint, model, prompt, response string, res *StreamResult, 
 		OutputTokens:  countTokens(response),
 		Endpoint:      endpoint,
 	}
+	if len(requested) > 0 {
+		r.RequestedModel = safeRequestedModel(requested[0], model)
+	}
 	if stream {
 		r.Stream = 1
 	}
 	if res != nil {
-		r.UpstreamModel = res.UpstreamModel
+		r.UpstreamModel = safeReportedModel(res.UpstreamModel)
+		r.ActualModel = r.UpstreamModel
+		r.ActualModelVerified = res.ModelIdentityVerified && r.ActualModel != ""
+		r.RetryCount = res.RetryCount
+		if res.FailureClass != "" && status != 499 {
+			r.FailureClass = res.FailureClass
+		}
 		r.TotalMs = res.TotalMs
 		r.TTFBMs = &res.TTFBMs
 		if res.ProxyID > 0 {
@@ -218,6 +241,9 @@ func recordRequest(endpoint, model, prompt, response string, res *StreamResult, 
 			r.AccountID = &res.AccountID
 		}
 		r.AccountLabel = res.AccountLabel
+		if r.AccountLabel == "" && res.AccountID > 0 {
+			r.AccountLabel = fmt.Sprintf("#%d", res.AccountID)
+		}
 	}
 	go insertRequest(r)
 }
@@ -292,6 +318,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream, _ := req["stream"].(bool)
+	if stream {
+		var cancel context.CancelFunc
+		w, r, cancel = bindGenerationWriter(w, r)
+		defer cancel()
+	}
 	includeUsage := false
 	if so, ok := req["stream_options"].(map[string]interface{}); ok {
 		includeUsage, _ = so["include_usage"].(bool)
@@ -316,23 +347,33 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			gate = newToolFenceGate(sse.SendContent)
 			onDelta = gate.Push
 		}
-		if !modelCfg.RequireModelIdentity {
-			ka = startKeepalive(sse.Ping)
-		}
+		ka = startKeepalive(sse.Ping)
+		defer ka.Stop()
 		onDelta, onReasoning = ka.guard(onDelta), ka.guard(onReasoning)
 	}
 
+	modelCfg.RequestContext = r.Context()
 	text, toolCalls, res, err := runOpenAIModel(messages, prompt, latest, modelCfg, tools, req["tool_choice"], images, onDelta, onReasoning)
 	ka.Stop() // 之后的收尾回到单 goroutine 写；Started() 也要在保活停下后再看
+	if r.Context().Err() != nil {
+		err = r.Context().Err()
+	}
 	if err != nil {
-		mde, downgraded := err.(*ModelDowngradedError)
-		status := 502
-		if downgraded {
-			status = 429
+		if r.Context().Err() != nil {
+			err = r.Context().Err()
 		}
-		recordRequest("chat.completions", modelName, prompt, "", res, status, err.Error(), stream)
+		mde, downgraded := err.(*ModelDowngradedError)
+		status, code := generationFailure(err)
+		recordRequest("chat.completions", modelName, prompt, "", res, status, code, stream, modelInput)
+		if status == 499 {
+			return
+		}
 		if sse != nil && sse.Started() {
-			sse.Fail(err) // 已经开流，HTTP 状态码改不了了
+			sse.Fail(errors.New(code)) // 已经开流，HTTP 状态码改不了了
+			return
+		}
+		if availabilityErr, ok := err.(*ModelAvailabilityError); ok {
+			writeGenerationError(w, availabilityErr)
 			return
 		}
 		if identityErr, ok := err.(*ModelIdentityError); ok {
@@ -359,7 +400,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}})
 			return
 		}
-		writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
+		writeGenerationError(w, err)
 		return
 	}
 
@@ -380,7 +421,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		finish = "tool_calls"
 	}
 
-	recordRequest("chat.completions", modelName, prompt, text, res, 200, "", stream)
+	recordRequest("chat.completions", modelName, prompt, text, res, 200, "", stream, modelInput)
 	if stream {
 		var usage map[string]int
 		if includeUsage {
@@ -601,6 +642,11 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream, _ := req["stream"].(bool)
+	if stream {
+		var cancel context.CancelFunc
+		w, r, cancel = bindGenerationWriter(w, r)
+		defer cancel()
+	}
 	rid := "resp_" + randHex(16)
 	mid := "msg_" + randHex(12)
 
@@ -615,6 +661,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	// 流式要先把头和 response.created 发出去，才能边收边推 delta。
 	// 代价是一旦开了流 HTTP 状态码就改不了了，上游失败只能用 response.failed
 	// 事件告知 —— 跟 /v1/chat/completions 那条路的取舍一致。
+	responseStarted := false
 	var writeEvent func(string, interface{})
 	var startResponse func()
 	var emitDelta func(string)
@@ -631,6 +678,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		startResponse = func() {
+			if responseStarted {
+				return
+			}
+			responseStarted = true
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no") // 关掉反代对 SSE 的缓冲，见 sse.go
@@ -671,6 +722,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		emitDelta = func(d string) {
+			startResponse()
 			ensureMsg()
 			writeEvent("response.output_text.delta", map[string]interface{}{
 				"type":          "response.output_text.delta",
@@ -688,30 +740,39 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			onDelta = gate.Push
 		}
 		// 这条路响应头一开始就发了，保活没有锁状态码的代价。
-		if !modelCfg.RequireModelIdentity {
+		{
 			ka = startKeepalive(func() {
+				startResponse()
 				fmt.Fprint(w, ": ping\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
 			})
 		}
+		defer ka.Stop()
 		onDelta = ka.guard(onDelta)
 	}
 
 	// onReasoning 传 nil：Responses API 有自己的 reasoning 事件形状，跟 chat 的
 	// reasoning_content 不通用，这条路目前不暴露思考链。
+	modelCfg.RequestContext = r.Context()
 	text, toolCalls, res, err := runOpenAIModel(messages, prompt, latest, modelCfg, tools, req["tool_choice"], images, onDelta, nil)
 	ka.Stop()
+	if r.Context().Err() != nil {
+		err = r.Context().Err()
+	}
 	if err != nil {
-		mde, downgraded := err.(*ModelDowngradedError)
-		status := 502
-		if downgraded {
-			status = 429
+		if r.Context().Err() != nil {
+			err = r.Context().Err()
 		}
-		recordRequest("responses", modelName, prompt, "", res, status, err.Error(), stream)
-		if stream && !modelCfg.RequireModelIdentity {
-			errObj := map[string]string{"message": err.Error()}
+		mde, downgraded := err.(*ModelDowngradedError)
+		status, code := generationFailure(err)
+		recordRequest("responses", modelName, prompt, "", res, status, code, stream, modelInput)
+		if status == 499 {
+			return
+		}
+		if stream && responseStarted {
+			errObj := map[string]string{"message": code, "code": code}
 			if downgraded {
 				errObj["code"] = "model_downgraded"
 			}
@@ -725,6 +786,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 					"error":  errObj,
 				},
 			})
+			return
+		}
+		if availabilityErr, ok := err.(*ModelAvailabilityError); ok {
+			writeGenerationError(w, availabilityErr)
 			return
 		}
 		if identityErr, ok := err.(*ModelIdentityError); ok {
@@ -751,7 +816,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			}})
 			return
 		}
-		writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
+		writeGenerationError(w, err)
 		return
 	}
 
@@ -783,7 +848,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	recordRequest("responses", modelName, prompt, text, res, 200, "", stream)
+	recordRequest("responses", modelName, prompt, text, res, 200, "", stream, modelInput)
 	if stream {
 		// 补上闸门扣住、或前缀 diff 跳过的尾巴，再发终态事件。
 		if rest := remainingOf(text, sentText(res, gate)); rest != "" {
@@ -855,4 +920,64 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		"output":     output,
 		"usage":      buildUsage(prompt, text, true),
 	})
+}
+
+// generationFailure exposes stable codes, never raw upstream error bodies.
+func generationFailure(err error) (int, string) {
+	if errors.Is(err, context.Canceled) {
+		return 499, "client_canceled"
+	}
+	var phase *generationPhaseTimeout
+	if errors.As(err, &phase) {
+		return 504, "upstream_" + phase.Phase + "_timeout"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return 504, "client_deadline"
+	}
+	if isUpstreamTimeout(err) {
+		return 504, "upstream_timeout"
+	}
+	if errors.Is(err, errProxyUnavailable) {
+		return 502, "proxy_unavailable"
+	}
+	if errors.Is(err, errUpstreamIncomplete) {
+		return 502, "upstream_incomplete"
+	}
+
+	var availability *ModelAvailabilityError
+	if errors.As(err, &availability) {
+		return availability.Status, availability.Code
+	}
+	var identity *ModelIdentityError
+	if errors.As(err, &identity) {
+		return 502, identity.code()
+	}
+	var downgrade *ModelDowngradedError
+	if errors.As(err, &downgrade) {
+		return 429, "model_downgraded"
+	}
+	var limit *RateLimitError
+	if errors.As(err, &limit) {
+		return 429, "ip_slot_full"
+	}
+	var prompt *PromptTooLongError
+	if errors.As(err, &prompt) {
+		return 400, "context_length_exceeded"
+	}
+	return 502, "upstream_error"
+}
+func writeGenerationError(w http.ResponseWriter, err error) {
+	status, code := generationFailure(err)
+	if status == 499 {
+		return
+	}
+	writeJSON(w, status, map[string]interface{}{"error": map[string]string{"message": code, "code": code, "type": "upstream_error"}})
+}
+
+func safeFailureCode(code string) bool {
+	switch code {
+	case "client_canceled", "client_deadline", "upstream_timeout", "upstream_first_frame_timeout", "upstream_idle_timeout", "upstream_overall_timeout", "model_session_account_changed", "model_account_unavailable", "upstream_error", "model_identity_mismatch", "model_identity_unverified", "model_downgraded", "ip_slot_full", "context_length_exceeded", "model_catalog_unavailable", "model_not_found", "model_unavailable", "proxy_unavailable", "upstream_incomplete":
+		return true
+	}
+	return false
 }

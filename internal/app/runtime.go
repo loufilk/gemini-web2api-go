@@ -19,17 +19,19 @@ import (
 // 否则它不在 body 里、每次点「保存并生效」都被解成零值冲掉（multi_turn 就这么被静默
 // 重置过，连 config.json 里设的都白设，见 #27）。
 type RuntimeConfig struct {
-	RetryAttempts   int    `json:"retry_attempts"`
-	RetryDelaySec   int    `json:"retry_delay_sec"`
-	RequestTimeout  int    `json:"request_timeout_sec"`
-	DefaultModel    string `json:"default_model"`
-	PerIPConcurrent int    `json:"per_ip_concurrent"`
-	PerIPRPM        int    `json:"per_ip_rpm"`
-	PerIPRPH        int    `json:"per_ip_rph"`
-	RetentionDays   int    `json:"retention_days"`
-	LogRequests     bool   `json:"log_requests"`
-	Impersonate     string `json:"impersonate"`
-	GeminiBL        string `json:"gemini_bl"`
+	RetryAttempts        int    `json:"retry_attempts"`
+	RetryDelaySec        int    `json:"retry_delay_sec"`
+	RequestTimeout       int    `json:"request_timeout_sec"`
+	FirstFrameTimeoutSec int    `json:"first_frame_timeout_sec"`
+	StreamIdleTimeoutSec int    `json:"stream_idle_timeout_sec"`
+	DefaultModel         string `json:"default_model"`
+	PerIPConcurrent      int    `json:"per_ip_concurrent"`
+	PerIPRPM             int    `json:"per_ip_rpm"`
+	PerIPRPH             int    `json:"per_ip_rph"`
+	RetentionDays        int    `json:"retention_days"`
+	LogRequests          bool   `json:"log_requests"`
+	Impersonate          string `json:"impersonate"`
+	GeminiBL             string `json:"gemini_bl"`
 	// ProxyCooldownMin 是代理连续失败熔断后隔多久放回池子，单位分钟。
 	// 0 = 不恢复（熔断即永久除名，要手动重置）。默认按实测的封禁恢复时长取 120。
 	ProxyCooldownMin int `json:"proxy_cooldown_min"`
@@ -91,18 +93,20 @@ var (
 // 必须在 DB 打开之后调用。
 func initRuntimeConfig() {
 	base := RuntimeConfig{
-		RetryAttempts:   cfg.RetryAttempts,
-		RetryDelaySec:   cfg.RetryDelaySec,
-		RequestTimeout:  cfg.RequestTimeout,
-		RetryOnTimeout:  cfg.RetryOnTimeout,
-		DefaultModel:    cfg.DefaultModel,
-		PerIPConcurrent: cfg.PerIPConcurrent,
-		PerIPRPM:        cfg.PerIPRPM,
-		PerIPRPH:        cfg.PerIPRPH,
-		RetentionDays:   cfg.RetentionDays,
-		LogRequests:     cfg.LogRequests,
-		Impersonate:     cfg.Impersonate,
-		GeminiBL:        cfg.GeminiBL,
+		RetryAttempts:        cfg.RetryAttempts,
+		RetryDelaySec:        cfg.RetryDelaySec,
+		RequestTimeout:       cfg.RequestTimeout,
+		FirstFrameTimeoutSec: cfg.FirstFrameTimeoutSec,
+		StreamIdleTimeoutSec: cfg.StreamIdleTimeoutSec,
+		RetryOnTimeout:       cfg.RetryOnTimeout,
+		DefaultModel:         cfg.DefaultModel,
+		PerIPConcurrent:      cfg.PerIPConcurrent,
+		PerIPRPM:             cfg.PerIPRPM,
+		PerIPRPH:             cfg.PerIPRPH,
+		RetentionDays:        cfg.RetentionDays,
+		LogRequests:          cfg.LogRequests,
+		Impersonate:          cfg.Impersonate,
+		GeminiBL:             cfg.GeminiBL,
 
 		ProxyCooldownMin: cfg.ProxyCooldownMin,
 		FallbackDirect:   cfg.FallbackDirect,
@@ -158,6 +162,8 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 		{"retry_attempts", c.RetryAttempts, 1, 10},
 		{"retry_delay_sec", c.RetryDelaySec, 0, 60},
 		{"request_timeout_sec", c.RequestTimeout, 5, 600},
+		{"first_frame_timeout_sec", c.FirstFrameTimeoutSec, 0, 600},
+		{"stream_idle_timeout_sec", c.StreamIdleTimeoutSec, 0, 600},
 		{"per_ip_concurrent", c.PerIPConcurrent, 0, 1000},
 		{"per_ip_rpm", c.PerIPRPM, 0, 10000},
 		{"per_ip_rph", c.PerIPRPH, 0, 100000},

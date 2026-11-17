@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -86,6 +87,13 @@ func invalidateXSRF(cookie string) {
 // getXSRF 取该 cookie（第 authuser 个号）对应的 XSRF token；命中缓存且没过期就直接返回。
 // cookie 为空（匿名）时返回空串——匿名请求不需要这个字段。
 func getXSRF(cookie string, authuser int, proxyURL string) (string, error) {
+	return getXSRFContext(context.Background(), cookie, authuser, proxyURL)
+}
+
+func getXSRFContext(ctx context.Context, cookie string, authuser int, proxyURL string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if cookie == "" {
 		return "", nil
 	}
@@ -98,7 +106,7 @@ func getXSRF(cookie string, authuser int, proxyURL string) (string, error) {
 	}
 	xsrfMu.Unlock()
 
-	e, err := fetchAppTokens(cookie, authuser, proxyURL)
+	e, err := fetchAppTokensContext(ctx, cookie, authuser, proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -135,6 +143,13 @@ func getUploadTokens(cookie string, authuser int, proxyURL string) (pushID, pctx
 // cookie 传空串就是匿名抓（页面照样返回，只是没有登录态字段）。
 // authuser>0 抓 /u/N/app，页面里的 token 才是第 N 个号的。
 func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) {
+	return fetchAppPageContext(context.Background(), cookie, authuser, proxyURL)
+}
+
+func fetchAppPageContext(ctx context.Context, cookie string, authuser int, proxyURL string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pageURL := geminiBase(authuser) + "/app"
 	headers := map[string]string{
 		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -146,7 +161,7 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 
 	var body []byte
 	if proxyURL != "" {
-		req, err := http.NewRequest("GET", pageURL, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +182,7 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 			return nil, err
 		}
 	} else {
-		req, err := fhttp.NewRequest("GET", pageURL, nil)
+		req, err := fhttp.NewRequestWithContext(ctx, "GET", pageURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -192,7 +207,11 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 
 // fetchAppTokens 抓一次 /app 页面，把三个 token 一起抠出来。
 func fetchAppTokens(cookie string, authuser int, proxyURL string) (xsrfEntry, error) {
-	body, err := fetchAppPage(cookie, authuser, proxyURL)
+	return fetchAppTokensContext(context.Background(), cookie, authuser, proxyURL)
+}
+
+func fetchAppTokensContext(ctx context.Context, cookie string, authuser int, proxyURL string) (xsrfEntry, error) {
+	body, err := fetchAppPageContext(ctx, cookie, authuser, proxyURL)
 	if err != nil {
 		return xsrfEntry{}, err
 	}

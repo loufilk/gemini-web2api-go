@@ -27,6 +27,8 @@ type convState struct {
 	sapisid               string // 登录态算 SAPISIDHASH 用；匿名为空
 	isLogin               bool
 	accountID             int64
+	accountLabel          string
+	modelFamily           string
 	authuser              int // 登录号的账号序号（/u/N）；整条会话不变，匿名为 0
 	proxyID               int64
 	proxyURL              string
@@ -248,13 +250,31 @@ const webUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 // cid/rid/rcid/tok26 和 turn+1，供下一轮续接。
 func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
+	ctx := modelRequestContext(mc)
+	if ctx.Err() != nil {
+		return &StreamResult{AccountID: conv.accountID, AccountLabel: conv.accountLabel}, ctx.Err()
+	}
 	p, slotOK, slotErr := acquireSlot(conv.proxyID)
 	if !slotOK {
-		return &StreamResult{}, slotErr
+		return &StreamResult{AccountID: conv.accountID, AccountLabel: conv.accountLabel}, slotErr
 	}
 	defer releaseSlot(p.ID)
 	proxyURL := p.URL
 	pickedOK := p.ID > 0
+	if mc.RequireModelIdentity {
+		account := accountByID(conv.accountID)
+		if account != nil && conv.turn > 0 && (account.AuthUser != conv.authuser || catalogIdentityDigest(account.Cookie) != catalogIdentityDigest(conv.cookie)) {
+			return &StreamResult{AccountID: conv.accountID, AccountLabel: conv.accountLabel, ProxyID: p.ID, ProxyName: p.Name}, &ModelAvailabilityError{Code: "model_session_account_changed", Status: 409}
+		}
+		if account != nil {
+			conv.accountLabel = accountDisplayName(account)
+		}
+		route, err := accountModelRoute(ctx, account, proxyURL, mc)
+		if err != nil {
+			return &StreamResult{AccountID: conv.accountID, AccountLabel: conv.accountLabel, ProxyID: p.ID, ProxyName: p.Name}, err
+		}
+		mc = route
+	}
 
 	// 首轮定出口；续接沿用会话原出口（acquireSlot 已优先，但拿不到原出口时只能换，
 	// 换了续接大概率失败，靠调用方回退到全量重发兜底）。
@@ -274,10 +294,10 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	// 登录态每轮要带 at（XSRF）；匿名不要。
 	xsrf := ""
 	if conv.isLogin && conv.cookie != "" {
-		if tok, err := getXSRF(conv.cookie, conv.authuser, proxyURL); err == nil {
+		if tok, err := getXSRFContext(ctx, conv.cookie, conv.authuser, proxyURL); err == nil {
 			xsrf = tok
 		} else {
-			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID},
+			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, AccountLabel: conv.accountLabel},
 				fmt.Errorf("取 XSRF 失败: %w", err)
 		}
 	}
@@ -330,7 +350,7 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 
 	geminiHeaders := buildGeminiHeaders(conv.cookie, conv.sapisid, mc.HexID)
 	setAuthUserHeaders(geminiHeaders, conv.authuser)
-	geminiHeaders["x-goog-ext-525001261-jspb"] = buildModelHeader(mc.HexID, mc.Mode, mc.thinkWire(), uuid.NewString())
+	geminiHeaders["x-goog-ext-525001261-jspb"] = modelRouteHeader(mc, uuid.NewString())
 	geminiHeaders["x-goog-ext-525005358-jspb"] = fmt.Sprintf(`["%s",1]`, reqUUID)
 
 	reqid := time.Now().UnixNano() % 1000000
@@ -338,16 +358,12 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 		"%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
 		geminiBase(conv.authuser), currentBL(proxyURL), reqid)
 
-	// Do not emit possibly mislabelled output before the complete identity check.
-	if mc.RequireModelIdentity {
-		onDelta, onReasoning = nil, nil
-	}
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
 	strictCheck := strictLineCheck(mc, func() int64 { return conv.accountID })
 	var lineCB func(string) error
-	if onDelta != nil || onReasoning != nil || strictCheck != nil {
-		lineCB = func(line string) error {
+	if onDelta != nil || onReasoning != nil || strictCheck != nil || mc.RequireModelIdentity {
+		emitter := func(line string) error {
 			if strictCheck != nil {
 				if err := strictCheck(line); err != nil {
 					return err
@@ -374,96 +390,73 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 			}
 			return nil
 		}
+		lineCB = guardedModelEmitter(mc, emitter)
 	}
 
 	t0 := time.Now()
-	var lastErr error
-	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
-		if len(setCookie) > 0 && conv.cookie != "" {
-			if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
-				conv.cookie = merged
+	statusCode, raw, ttfb, setCookie, err := doGeminiRequestContext(modelGenerationContext(ctx), endpoint, body, geminiHeaders, proxyURL, lineCB)
+	if len(setCookie) > 0 && conv.cookie != "" {
+		if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
+			conv.cookie = merged
+			if conv.accountID > 0 {
+				updateAccountCookie(conv.accountID, merged)
 			}
 		}
-		// 降级：同一个号重试还是降级，直接交给上层（见 gemini.go 同一处）。
-		var mde *ModelDowngradedError
-		if errors.As(err, &mde) {
-			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID,
-				UpstreamModel: mde.Reported, TotalMs: time.Since(t0).Milliseconds(),
-				Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted}, err
-		}
-		if err != nil || statusCode != 200 || !hasContentFrame(string(raw)) {
-			if err == nil && statusCode == 200 {
-				lastErr = fmt.Errorf("续接无内容帧（会话可能已失效，raw %d 字节）", len(raw))
-			} else if err != nil {
-				lastErr = err
-			} else {
-				lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 160))
-			}
-			// 出错话术跟出口无关，不记进代理健康度
-			if pickedOK && !errors.Is(err, errUpstreamFailureReply) {
-				recordProxyResult(p.ID, false, lastErr.Error())
-			}
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if !retryAfterTimeout(err) {
-				logf("上游超时，retry_on_timeout 关着，不再重试: %v", err)
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				if errors.Is(err, errUpstreamFailureReply) {
-					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
-				}
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
-		}
-		// 非流式没有 lineCB，在这里补判出错话术。续接状态还没回填，重发仍接在上一轮后面。
-		if hasFailureReply(string(raw)) {
-			lastErr = errUpstreamFailureReply
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
-		}
-		if reported, identityErr := verifyModelIdentity(mc, string(raw)); identityErr != nil {
-			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, UpstreamModel: reported, TotalMs: time.Since(t0).Milliseconds()}, identityErr
-		}
-		// 成功：回填续接状态。
-		cid, rid, rcid, tok26 := parseConvIDs(string(raw))
-		if cid != "" {
-			conv.cid = cid
-		}
-		if rid != "" {
-			conv.rid = rid
-		}
-		if rcid != "" {
-			conv.rcid = rcid
-		}
-		conv.tok26 = tok26 // 每轮更新（可能为空）
-		conv.turn++
-		if pickedOK {
-			recordProxyResult(p.ID, true, "")
-		}
-		return &StreamResult{
-			Emitted:          tracker.emitted,
-			EmittedReasoning: rtracker.emitted,
-			Raw:              string(raw),
-			Reasoning:        extractReasoning(string(raw)),
-			UpstreamModel:    extractUpstreamModel(string(raw)),
-			ProxyID:          p.ID,
-			ProxyName:        p.Name,
-			AccountID:        conv.accountID,
-			TTFBMs:           ttfb,
-			TotalMs:          time.Since(t0).Milliseconds(),
-		}, nil
 	}
-	return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, lastErr
+	result := &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, AccountLabel: conv.accountLabel,
+		TTFBMs: ttfb, TotalMs: time.Since(t0).Milliseconds(), Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted, GenerationAttempts: 1}
+	if err != nil {
+		var identity *ModelIdentityError
+		var downgraded *ModelDowngradedError
+		if errors.As(err, &identity) {
+			result.UpstreamModel = identity.Reported
+		}
+		if errors.As(err, &downgraded) {
+			result.UpstreamModel = downgraded.Reported
+		}
+		if pickedOK && ctx.Err() == nil && identity == nil && downgraded == nil && !isUpstreamTimeout(err) && !errors.Is(err, errUpstreamFailureReply) {
+			recordProxyResult(p.ID, false, "generation_transport_error")
+		}
+		return result, modelMismatchForAccount(err, conv.accountID)
+	}
+	if statusCode != 200 {
+		return result, fmt.Errorf("upstream HTTP %d", statusCode)
+	}
+	if !hasContentFrame(string(raw)) {
+		return result, fmt.Errorf("upstream returned no conversation content")
+	}
+	if hasFailureReply(string(raw)) {
+		return result, errUpstreamFailureReply
+	}
+	reported, identityErr := verifyModelIdentity(mc, string(raw))
+	result.UpstreamModel = reported
+	if identityErr != nil {
+		return result, modelMismatchForAccount(identityErr, conv.accountID)
+	}
+	if reported == "" {
+		result.UpstreamModel = extractUpstreamModel(string(raw))
+	}
+	result.ModelIdentityVerified = mc.RequireModelIdentity
+	result.Raw = string(raw)
+	result.Reasoning = extractReasoning(result.Raw)
+
+	// 成功：回填续接状态。
+	cid, rid, rcid, tok26 := parseConvIDs(string(raw))
+	if cid != "" {
+		conv.cid = cid
+	}
+	if rid != "" {
+		conv.rid = rid
+	}
+	if rcid != "" {
+		conv.rcid = rcid
+	}
+	conv.tok26 = tok26 // 每轮更新（可能为空）
+	conv.turn++
+	if pickedOK {
+		recordProxyResult(p.ID, true, "")
+	}
+	return result, nil
 }
 
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。
@@ -476,7 +469,12 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 	onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
 	parentKey := convParentKey(messages)
 	conv := convGet(parentKey)
+	family := canonicalCapability(mc)
+	if conv != nil && conv.modelFamily != family {
+		conv = nil
+	}
 	fresh := conv == nil
+	ctx := modelRequestContext(mc)
 
 	var prompt string
 	if fresh {
@@ -494,9 +492,15 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 	exclude := map[int64]bool{}
 	var res *StreamResult
 	var err error
+	var availabilityErr error
+	var availabilityRes *StreamResult
+	totalAttempts := 0
 	for try := 0; try < maxCookieTries; try++ {
+		if ctx.Err() != nil {
+			return "", nil, res, ctx.Err()
+		}
 		if fresh {
-			conv = &convState{}
+			conv = &convState{modelFamily: family}
 			// 有 cookie 池就用登录号（能力更全），否则匿名（首轮就地拿 session cookie）。
 			// #20 匿名优先：模型不需要登录态时不占号（多轮已被 gate 限成无图无工具，附件
 			// 恒无，所以第二个参数传 false）。必须在调用前短路：挑号会更新
@@ -510,6 +514,9 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 						last.RetryAfter = perr.(*ModelDowngradedError).RetryAfter
 						break
 					}
+					if availabilityErr != nil {
+						return "", nil, availabilityRes, availabilityErr
+					}
 					return "", nil, &StreamResult{}, perr
 				}
 				if a != nil {
@@ -517,17 +524,36 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 					conv.sapisid = extractSAPISID(a.Cookie)
 					conv.isLogin = true
 					conv.accountID = a.ID
+					conv.accountLabel = accountDisplayName(a)
 					conv.authuser = a.AuthUser
 					conv.proxyID = a.ProxyID
 				}
 			}
 		}
 		res, err = streamGenerateConv(prompt, mc, conv, onDelta, onReasoning)
+		if res != nil {
+			totalAttempts += res.GenerationAttempts
+			res.RetryCount = max(0, totalAttempts-1)
+		}
+		var availability *ModelAvailabilityError
+		if fresh && conv.accountID > 0 && errors.As(err, &availability) {
+			nextAvailability := strongerModelAvailability(availabilityErr, err)
+			if nextAvailability == err {
+				availabilityRes = res
+			}
+			availabilityErr = nextAvailability
+			exclude[conv.accountID] = true
+			continue // capability discovery never submits generation
+		}
 		if !retryOnAnotherAccount(res, err, mc, exclude) || !fresh {
 			break
 		}
 	}
 	if err != nil {
+		var availability *ModelAvailabilityError
+		if availabilityErr != nil && errors.As(err, &availability) {
+			return "", nil, availabilityRes, availabilityErr
+		}
 		if !fresh {
 			// 续接失败：这路会话作废，客户端重试时会当新会话全量重发。
 			convDelete(parentKey)

@@ -3,12 +3,11 @@ package app
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -278,20 +277,14 @@ func writeGeminiError(w http.ResponseWriter, code int, msg string) {
 
 // writeGeminiCallError 跟 OpenAI 那两条路同一套分流：降级 429、超长 400、限流 429、其余 502。
 func writeGeminiCallError(w http.ResponseWriter, err error) {
-	switch e := err.(type) {
-	case *ModelIdentityError:
-		writeGeminiError(w, http.StatusBadGateway, e.Error())
-	case *ModelDowngradedError:
-		if e.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(e.RetryAfter.Seconds()))))
-		}
-		writeGeminiError(w, 429, e.Error())
-	case *PromptTooLongError:
-		writeGeminiError(w, 400, e.Error())
-	case *RateLimitError:
-		writeGeminiError(w, 429, e.Error())
-	default:
-		writeGeminiError(w, 502, "upstream error: "+err.Error())
+	status, code := generationFailure(err)
+	var identity *ModelIdentityError
+	if errors.As(err, &identity) {
+		writeGeminiError(w, 502, identity.Error())
+		return
+	}
+	if status != 499 {
+		writeGeminiError(w, status, code)
 	}
 }
 
@@ -316,7 +309,7 @@ func handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 		writeGeminiError(w, 405, "method not allowed")
 		return
 	}
-	all := availableModels()
+	all := catalogModels(r.Context())
 	names := make([]string, 0, len(all))
 	for n := range all {
 		names = append(names, n)
@@ -358,6 +351,12 @@ func handleGeminiModelItem(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeGeminiError(w, 404, err.Error())
 			return
+		}
+		if c.RequireModelIdentity {
+			if _, ok := catalogModels(r.Context())[name]; !ok {
+				writeGeminiError(w, 404, "model_unavailable")
+				return
+			}
 		}
 		writeJSON(w, 200, geminiModelInfo(name, c))
 	case r.Method != "POST":
@@ -472,15 +471,16 @@ func geminiCandidate(parts []interface{}, finish string) map[string]interface{} 
 // prepareGemini 是 generateContent / streamGenerateContent 共用的前半段：
 // 解析、选模型、收图、拼 prompt。出错时已经写好响应。
 type geminiCall struct {
-	req        *geminiAPIRequest
-	modelName  string
-	modelCfg   ModelConfig
-	messages   []map[string]interface{}
-	tools      []map[string]interface{}
-	toolChoice interface{}
-	images     []pendingUpload
-	prompt     string
-	latest     string
+	req            *geminiAPIRequest
+	requestedModel string
+	modelName      string
+	modelCfg       ModelConfig
+	messages       []map[string]interface{}
+	tools          []map[string]interface{}
+	toolChoice     interface{}
+	images         []pendingUpload
+	prompt         string
+	latest         string
 }
 
 func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*geminiCall, bool) {
@@ -511,7 +511,8 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		writeGeminiError(w, 400, "contents is empty")
 		return nil, false
 	}
-	return &geminiCall{req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
+	modelCfg.RequestContext = r.Context()
+	return &geminiCall{requestedModel: model, req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
 		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, latest: latest}, true
 }
 
@@ -534,16 +535,22 @@ func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string)
 		return
 	}
 	text, calls, res, err := runGeminiCall(g, nil, nil)
+	if r.Context().Err() != nil {
+		err = r.Context().Err()
+	}
 	if err != nil {
-		status := 502
-		if _, ok := err.(*ModelDowngradedError); ok {
-			status = 429
+		if r.Context().Err() != nil {
+			err = r.Context().Err()
 		}
-		recordRequest("gemini.generateContent", g.modelName, g.prompt, "", res, status, err.Error(), false)
+		status, code := generationFailure(err)
+		recordRequest("gemini.generateContent", g.modelName, g.prompt, "", res, status, code, false, g.requestedModel)
+		if status == 499 {
+			return
+		}
 		writeGeminiCallError(w, err)
 		return
 	}
-	recordRequest("gemini.generateContent", g.modelName, g.prompt, text, res, 200, "", false)
+	recordRequest("gemini.generateContent", g.modelName, g.prompt, text, res, 200, "", false, g.requestedModel)
 
 	t := newGeminiTurn(text, calls, res)
 	var parts []interface{}
@@ -573,17 +580,21 @@ func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string)
 //
 // 跟 sseWriter 一样第一块才发响应头：开流前出的错还能回正常的 HTTP 状态码。
 type geminiStream struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	sse     bool
-	n       int // 已写出的块数
-	model   string
-	rid     string
+	w        http.ResponseWriter
+	flusher  http.Flusher
+	sse      bool
+	n        int // 已写出的块数
+	model    string
+	rid      string
+	terminal bool
 }
 
 func (s *geminiStream) Started() bool { return s.n > 0 }
 
 func (s *geminiStream) write(obj interface{}) {
+	if s.terminal {
+		return
+	}
 	b, _ := json.Marshal(obj)
 	if s.n == 0 {
 		if s.sse {
@@ -648,12 +659,18 @@ func (s *geminiStream) fail(err error) {
 }
 
 func (s *geminiStream) end() {
+	if s.terminal {
+		return
+	}
+	s.terminal = true
 	if !s.sse && s.n > 0 {
 		io.WriteString(s.w, "]")
 	}
 }
 
 func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model string) {
+	w, r, cancel := bindGenerationWriter(w, r)
+	defer cancel()
 	g, ok := prepareGemini(w, r, model)
 	if !ok {
 		return
@@ -674,28 +691,32 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 	if includeThoughts {
 		onReasoning = st.thought
 	}
-	var ka *streamKeepalive
-	if !g.modelCfg.RequireModelIdentity {
-		ka = startKeepalive(st.ping)
-	}
+	ka := startKeepalive(st.ping)
+	defer ka.Stop()
 	onDelta, onReasoning = ka.guard(onDelta), ka.guard(onReasoning)
 
 	text, calls, res, err := runGeminiCall(g, onDelta, onReasoning)
 	ka.Stop() // 之后的收尾回到单 goroutine 写；Started() 也要在保活停下后再看
+	if r.Context().Err() != nil {
+		err = r.Context().Err()
+	}
 	if err != nil {
-		status := 502
-		if _, ok := err.(*ModelDowngradedError); ok {
-			status = 429
+		if r.Context().Err() != nil {
+			err = r.Context().Err()
 		}
-		recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, "", res, status, err.Error(), true)
+		status, code := generationFailure(err)
+		recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, "", res, status, code, true, g.requestedModel)
+		if status == 499 {
+			return
+		}
 		if st.Started() {
-			st.fail(err)
+			st.fail(errors.New(code))
 			return
 		}
 		writeGeminiCallError(w, err)
 		return
 	}
-	recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, text, res, 200, "", true)
+	recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, text, res, 200, "", true, g.requestedModel)
 
 	t := newGeminiTurn(text, calls, res)
 	// 补发真流式没推到的尾巴：思考在前、正文在后，保持「先思考后回答」的顺序。

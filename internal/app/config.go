@@ -7,22 +7,24 @@ import (
 )
 
 type Config struct {
-	Port           int    `json:"port"`
-	Host           string `json:"host"`
-	RetryAttempts  int    `json:"retry_attempts"`
-	RetryDelaySec  int    `json:"retry_delay_sec"`
-	RequestTimeout int    `json:"request_timeout_sec"`
-	RetryOnTimeout bool   `json:"retry_on_timeout"`
-	GeminiBL       string `json:"gemini_bl"`
-	DefaultModel   string `json:"default_model"`
-	LogRequests    bool   `json:"log_requests"`
-	CookieFile     string `json:"cookie_file"`
-	Proxy          string `json:"proxy"` // 只用于启动时播种代理池，见 seedProxiesFromConfig
-	Impersonate    string `json:"impersonate"`
-	DBPath         string `json:"db_path"`
-	AdminToken     string `json:"admin_token"`
-	AdminEnabled   bool   `json:"admin_enabled"`
-	RetentionDays  int    `json:"retention_days"`
+	Port                 int    `json:"port"`
+	Host                 string `json:"host"`
+	RetryAttempts        int    `json:"retry_attempts"`
+	RetryDelaySec        int    `json:"retry_delay_sec"`
+	RequestTimeout       int    `json:"request_timeout_sec"`
+	FirstFrameTimeoutSec int    `json:"first_frame_timeout_sec"`
+	StreamIdleTimeoutSec int    `json:"stream_idle_timeout_sec"`
+	RetryOnTimeout       bool   `json:"retry_on_timeout"`
+	GeminiBL             string `json:"gemini_bl"`
+	DefaultModel         string `json:"default_model"`
+	LogRequests          bool   `json:"log_requests"`
+	CookieFile           string `json:"cookie_file"`
+	Proxy                string `json:"proxy"` // 只用于启动时播种代理池，见 seedProxiesFromConfig
+	Impersonate          string `json:"impersonate"`
+	DBPath               string `json:"db_path"`
+	AdminToken           string `json:"admin_token"`
+	AdminEnabled         bool   `json:"admin_enabled"`
+	RetentionDays        int    `json:"retention_days"`
 
 	// Per-IP rate limit (一个 slot = 直连/或一个代理),0 表示不限。
 	// 默认值取实测区间 80-180 的下沿，详见 ratelimit.go 的说明。

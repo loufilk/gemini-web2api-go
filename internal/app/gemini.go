@@ -68,6 +68,8 @@ const (
 
 // ModelConfig holds the server-side model id plus the legacy MODE_CATEGORY value.
 type ModelConfig struct {
+	RequestContext                        context.Context
+	CatalogCapacity, CatalogCapacityField int
 	// HexID 走 x-goog-ext-525001261-jspb header，是服务端唯一认的模型开关。
 	// 实测：不发这个 header 时 inner[79] 取 1..6 全部落到 3.5 Flash-Lite；
 	// header 写 3.6 而 inner[79] 写 6 时拿到的是 3.6 —— header 压过 inner[79]。
@@ -133,7 +135,7 @@ func (mc ModelConfig) thinkWire() int {
 var Models = map[string]ModelConfig{
 	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Upstream: "3.6 Flash", Desc: "Latest all-around model"},
 	"gemini-3.5-flash-lite": {HexID: hexFlashLite, Mode: 6, Upstream: "3.5 Flash-Lite", Desc: "Fastest, lightweight"},
-	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Upstream: "3.1 Pro", Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
+	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Upstream: "3.1 Pro", RequireModelIdentity: true, Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
 	// 3.8 Flash：Google 把原 3.7 那个 hex 原地升级了（同 hex，服务端显示名从 3.7 变 3.8）。
 	// 实测是**付费号专属**（不是灰度）：只有付费 Gemini 账号有，免费号降级成 3.5 Flash-Lite。
 	// gemini-3.7-flash 保留为别名（同 hex）。
@@ -151,7 +153,7 @@ var Models = map[string]ModelConfig{
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
 	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Upstream: "3.6 Flash", Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
 	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Upstream: "3.5 Flash-Lite", Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
-	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
+	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", RequireModelIdentity: true, Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
 	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "Legacy Flash route with extended thinking, now 4 Hydrogen on upgraded accounts; needs a signed-in PAID account"},
 	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", RequireModelIdentity: true, HiddenFromCatalog: true, Desc: "alias of gemini-3.8-flash-thinking"},
 	// 同一付费路由的扩展思考（think=2），不是其他账号清单里独立的 Mode=5 Thinking 模型。
@@ -276,9 +278,13 @@ type StreamResult struct {
 	// UpstreamModel 是服务端在响应帧 [42] 里自报的模型显示名。
 	// 跟请求的模型未必一致：gemini-3.1-pro 匿名时被静默降级成 3.5 Flash-Lite，
 	// 只看请求名根本发现不了，所以这个字段要一直记着。
-	UpstreamModel string
-	ProxyID       int64
-	ProxyName     string
+	UpstreamModel         string
+	ModelIdentityVerified bool
+	RetryCount            int
+	GenerationAttempts    int
+	FailureClass          string
+	ProxyID               int64
+	ProxyName             string
 	// 用了 cookie 池里的哪个账号，0 = 匿名。失败的请求也要带上——
 	// 排查"加了 cookie 就大面积失败"时，最需要知道的正是失败那条用的哪个号。
 	AccountID    int64
@@ -313,6 +319,8 @@ func (e *RateLimitError) Error() string {
 // 全满返回 *RateLimitError。
 //
 // 调用方拿到 (proxy, ok=true) 必须配 deferred releaseSlot()。
+var errProxyUnavailable = errors.New("proxy_unavailable")
+
 func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 	// 1. 先试代理池（如果配了）
 	proxyMu.RLock()
@@ -324,7 +332,7 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 			return p, true, nil
 		} else if !rtCfg().FallbackDirect {
 			if reason == "unavailable" {
-				return Proxy{}, false, fmt.Errorf("proxy_unavailable: all configured proxies are disabled or in circuit-breaker cooldown")
+				return Proxy{}, false, fmt.Errorf("%w: all configured proxies are disabled or in circuit-breaker cooldown", errProxyUnavailable)
 			}
 			return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: -1}
 		}
@@ -419,11 +427,20 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
 	// strict_model 换号：被降级的号记冷却、本次排除，换下一个号重来。上限跟 XSRF 换号
 	// 一样是 maxCookieTries——连着几个号都降级，说明池子整体见底，不是撞上个别号。
+	ctx := modelRequestContext(mc)
 	exclude := map[int64]bool{}
 	var res *StreamResult
 	var err error
+	totalAttempts := 0
 	for try := 0; try < maxCookieTries; try++ {
+		if ctx.Err() != nil {
+			return res, ctx.Err()
+		}
 		next, nextErr := streamGenerateOnce(prompt, latest, mc, pending, onDelta, onReasoning, exclude)
+		if next != nil {
+			totalAttempts += next.GenerationAttempts
+			next.RetryCount = max(0, totalAttempts-1)
+		}
 		var exhausted *ModelDowngradedError
 		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
 			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
@@ -443,7 +460,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 
 func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string), exclude map[int64]bool) (*StreamResult, error) {
+	ctx := modelRequestContext(mc)
 	var files []fileRef
+	var capabilityErr error
 
 	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
 	// 否则一个号在几十个出口之间跳，在 Google 眼里就是账号共享的特征。
@@ -477,10 +496,11 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	var picked Proxy
 	var cookieID int64
 	var cookieLabel string
+	var generationAttempts int
 	attrib := func(err error) (*StreamResult, error) {
 		return &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
-			ProxyID: picked.ID, ProxyName: picked.Name,
+			ProxyID: picked.ID, ProxyName: picked.Name, GenerationAttempts: generationAttempts,
 		}, err
 	}
 
@@ -512,8 +532,22 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
+		if ctx.Err() != nil {
+			return attrib(ctx.Err())
+		}
+		tok, err := getXSRFContext(ctx, acct.Cookie, acct.AuthUser, proxyURL)
 		if err == nil {
+			routed, accessErr := accountModelRoute(ctx, acct, proxyURL, mc)
+			if accessErr != nil {
+				capabilityErr = strongerModelAvailability(capabilityErr, accessErr)
+				next := mergeAccountExclusions(skip, tried)
+				acct = nil
+				if mc.PinAccountID == 0 {
+					acct, _ = pickCookieAccountExcept(next)
+				}
+				continue
+			}
+			mc = routed
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
 			authUser = acct.AuthUser
 			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
@@ -533,11 +567,25 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
 		// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
 		// 只试一次，且只在这一轮。
+		if ctx.Err() != nil {
+			return attrib(ctx.Err())
+		}
 		if !rotatedOnce[acct.ID] {
 			rotatedOnce[acct.ID] = true
 			if _, _, rerr := rotateAccount(*acct); rerr == nil {
 				if fresh := accountByID(acct.ID); fresh != nil {
-					if tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
+					if tok2, err2 := getXSRFContext(ctx, fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
+						routed, accessErr := accountModelRoute(ctx, fresh, proxyURL, mc)
+						if accessErr != nil {
+							capabilityErr = strongerModelAvailability(capabilityErr, accessErr)
+							next := mergeAccountExclusions(skip, tried)
+							acct = nil
+							if mc.PinAccountID == 0 {
+								acct, _ = pickCookieAccountExcept(next)
+							}
+							continue
+						}
+						mc = routed
 						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
 						acct = fresh
 						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
@@ -553,10 +601,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		// 救不回来：是 cookie 的错就记一次失败，让面板上看得出是哪个号该换了；
 		// 断网、出口被拦不记（见 xsrfErrBlamesCookie）。然后换下一个。
 		if xsrfErrBlamesCookie(err) {
-			markCookieByStatus(acct.ID, 401, err.Error())
+			markCookieByStatus(acct.ID, 401, "account_authentication_failed")
 		}
 		lastCookieErr = err
-		logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
+		logf("[cookie] 账号 #%d 准备失败，换下一个", acct.ID)
 		if mc.PinAccountID > 0 {
 			acct = nil // pinned: never switch to another account mid-conversation
 			continue
@@ -570,6 +618,19 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		}
 		acct, _ = pickCookieAccountExcept(next) // 取不到时返回 nil，循环自然结束
 	}
+	if ctx.Err() != nil {
+		return attrib(ctx.Err())
+	}
+	if mc.RequireModelIdentity && cookieStr == "" {
+		if capabilityErr != nil {
+			return attrib(capabilityErr)
+		}
+		if lastCookieErr != nil {
+			return attrib(&ModelAvailabilityError{Code: "model_account_unavailable", Status: 503})
+		}
+		return attrib(&ModelAvailabilityError{Code: "model_unavailable", Status: 404})
+	}
+
 	if lastCookieErr != nil && cookieStr == "" {
 		if mc.PinAccountID > 0 {
 			return attrib(&pinnedAccountError{ID: mc.PinAccountID, Err: lastCookieErr})
@@ -605,6 +666,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		}
 		nImg, nVid := 0, 0
 		for _, u := range pending {
+			if ctx.Err() != nil {
+				return attrib(ctx.Err())
+			}
 			ref, uerr := uploadBytes(cookieStr, authUser, proxyURL, u.Data, u.Name)
 			if uerr != nil {
 				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
@@ -736,7 +800,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	body := buildBody(xsrfToken)
 
 	// 抓包里 header 下标 16 和 inner[59] 是两个不同的 uuid，各生成各的。
-	modelHeader := buildModelHeader(mc.HexID, mc.Mode, mc.thinkWire(), uuid.NewString())
+	modelHeader := modelRouteHeader(mc, uuid.NewString())
 	sessionHeader := fmt.Sprintf(`["%s",1]`, reqUUID)
 
 	geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
@@ -750,16 +814,12 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
 	t0 := time.Now()
 
-	// Do not emit possibly mislabelled output before the complete identity check.
-	if mc.RequireModelIdentity {
-		onDelta, onReasoning = nil, nil
-	}
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
 	strictCheck := strictLineCheck(mc, func() int64 { return cookieID })
 	var lineCB func(string) error
-	if onDelta != nil || onReasoning != nil || strictCheck != nil {
-		lineCB = func(line string) error {
+	if onDelta != nil || onReasoning != nil || strictCheck != nil || mc.RequireModelIdentity {
+		emitter := func(line string) error {
 			if strictCheck != nil {
 				if err := strictCheck(line); err != nil {
 					return err
@@ -787,26 +847,31 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			}
 			return nil
 		}
+		lineCB = guardedModelEmitter(mc, emitter)
 	}
 
 	// 新协议（#43）：同一个 inner，只换传输层；返回的 raw 已包成老格式，下面的判断原样适用。
-	useWC := rtCfg().WebChannel
+	useWC := rtCfg().WebChannel && mc.CatalogCapacityField != 13
 	wcReq := wcRequest{
 		Inner: wcInnerWithoutPrompt(inner), Prompt: prompt,
-		HexID: mc.HexID, Mode: mc.Mode, Think: mc.thinkWire(),
+		HexID: mc.HexID, Mode: mc.Mode, Think: mc.thinkWire(), Capacity: mc.CatalogCapacity,
 		Cookie: cookieStr, SAPISID: sapisid, AuthUser: authUser,
 	}
-	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+	for attempt := 0; attempt < 1; attempt++ {
+		if ctx.Err() != nil {
+			return attrib(ctx.Err())
+		}
 		var statusCode int
 		var raw []byte
 		var ttfb int64
 		var setCookie []string
 		var err error
+		generationAttempts++
 		if useWC {
 			wcReq.Cookie = cookieStr
-			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(wcReq, proxyURL, lineCB)
+			statusCode, raw, ttfb, setCookie, err = doWebChannelRequestContext(modelGenerationContext(ctx), wcReq, proxyURL, lineCB)
 		} else {
-			statusCode, raw, ttfb, setCookie, err = doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+			statusCode, raw, ttfb, setCookie, err = doGeminiRequestContext(modelGenerationContext(ctx), endpoint, body, geminiHeaders, proxyURL, lineCB)
 		}
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
@@ -814,43 +879,36 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 				updateAccountCookie(cookieID, merged)
 			}
 		}
-		// 降级不是出口或 cookie 的错，也不该重试：同一个号再发一次还是降级。
+		err = modelMismatchForAccount(err, cookieID)
 		var mde *ModelDowngradedError
-		if errors.As(err, &mde) {
+		var lineIdentityErr *ModelIdentityError
+		if errors.As(err, &mde) || errors.As(err, &lineIdentityErr) {
 			res, _ := attrib(nil)
-			res.UpstreamModel = mde.Reported
-			res.TotalMs = time.Since(t0).Milliseconds()
-			// 带上已发出的部分：调用方据此判断还能不能换号重来
+			if mde != nil {
+				res.UpstreamModel = mde.Reported
+			} else {
+				res.UpstreamModel = lineIdentityErr.Reported
+			}
+			res.TTFBMs, res.TotalMs = ttfb, time.Since(t0).Milliseconds()
 			res.Emitted, res.EmittedReasoning = tracker.emitted, rtracker.emitted
 			return res, err
 		}
 		if err != nil {
-			lastErr = err
-			// 出错话术不记进代理健康度：匿名直连也一样出，跟出口无关，算进去会误熔断。
-			if pickedOK && !errors.Is(err, errUpstreamFailureReply) {
-				recordProxyResult(picked.ID, false, err.Error())
+			res, _ := attrib(nil)
+			res.TTFBMs, res.TotalMs = ttfb, time.Since(t0).Milliseconds()
+			res.Emitted, res.EmittedReasoning = tracker.emitted, rtracker.emitted
+			if pickedOK && ctx.Err() == nil && !isUpstreamTimeout(err) && !errors.Is(err, errUpstreamFailureReply) {
+				recordProxyResult(picked.ID, false, "generation_transport_error")
 			}
-			// 已经往客户端吐过内容就不能重试，否则会重复（思考链也算吐过）。
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if !retryAfterTimeout(err) {
-				logf("上游超时，retry_on_timeout 关着，不再重试: %v", err)
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
+			return res, err // transport errors cannot prove that generation did not execute
 		}
 		if statusCode != 200 {
 			// token 过期时上游回 400 + xsrf。作废缓存重取一次再打，
 			// 这种自愈不算进重试预算，否则一次过期就吃掉全部重试。
-			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
+			if !useWC && statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 				xsrfRetried = true
 				invalidateXSRF(cookieStr)
-				if tok, e := getXSRF(cookieStr, authUser, proxyURL); e == nil {
+				if tok, e := getXSRFContext(ctx, cookieStr, authUser, proxyURL); e == nil {
 					body = buildBody(tok)
 					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
 					setAuthUserHeaders(geminiHeaders, authUser)
@@ -860,23 +918,17 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 					continue
 				}
 			}
-			lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 200))
 			lastStatus = statusCode
+			lastErr = fmt.Errorf("upstream HTTP %d", statusCode)
 			if pickedOK {
 				recordProxyResult(picked.ID, false, lastErr.Error())
 			}
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
+			break
 		}
+		// Do not retry a missing content frame: generation may have executed.
 		// HTTP 200 但一个内容帧都没有 —— 上游的瞬时拒绝（响应里那个 1155）。
 		// 它不是限流：干净 IP 间隔 1s 连打 15 次全过、同 IP 并发 10 共 18 次全过、
 		// 打了 60+ 次的 IP 之后照样成功，没有可预测阈值，同样的请求有时成功有时失败。
-		// 重发一次通常就好，所以必须纳入重试——不然一次抖动就变成客户端可见的 502。
 		//
 		// 判据是**有没有内容帧**，不是 BardErrorInfo：正常响应的结束帧里也带错误码
 		// （1096 = 会话未持久化），拿它判错会把每个正常响应都判成失败。
@@ -887,54 +939,42 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		// exists, treat it as accepted and let fetchMediaArtifacts poll hNvQHb.
 		if !hasContentFrame(string(raw)) && !videoAccepted(mc.Tool, string(raw)) {
 			lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
-			if pickedOK {
-				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
-				// 脏出口一天约 9 次），连续踩中说明这个出口该歇了。
-				recordProxyResult(picked.ID, false, lastErr.Error())
-			}
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
+			break
 		}
-		// 非流式没有 lineCB，在这里补判出错话术。重试跟空响应同理：重发通常就好。
 		if hasFailureReply(string(raw)) {
 			lastErr = errUpstreamFailureReply
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
+			break
 		}
-		if reported, identityErr := verifyModelIdentity(mc, string(raw)); identityErr != nil {
+		reported, identityErr := verifyModelIdentity(mc, string(raw))
+		if identityErr != nil {
 			res, _ := attrib(nil)
 			res.UpstreamModel = reported
-			res.TotalMs = time.Since(t0).Milliseconds()
-			return res, identityErr
+			res.TTFBMs, res.TotalMs = ttfb, time.Since(t0).Milliseconds()
+			res.Emitted, res.EmittedReasoning = tracker.emitted, rtracker.emitted
+			return res, modelMismatchForAccount(identityErr, cookieID)
 		}
+		if reported == "" {
+			reported = extractUpstreamModel(string(raw))
+		}
+
 		if pickedOK {
 			recordProxyResult(picked.ID, true, "")
 		}
 		markCookieByStatus(cookieID, 200, "")
 		result := &StreamResult{
-			Emitted:          tracker.emitted,
-			EmittedReasoning: rtracker.emitted,
-			Raw:              string(raw),
-			Reasoning:        extractReasoning(string(raw)),
-			UpstreamModel:    extractUpstreamModel(string(raw)),
-			ProxyID:          picked.ID,
-			ProxyName:        picked.Name,
-			AccountID:        cookieID,
-			AccountLabel:     cookieLabel,
-			TTFBMs:           ttfb,
-			TotalMs:          time.Since(t0).Milliseconds(),
+			Emitted:               tracker.emitted,
+			EmittedReasoning:      rtracker.emitted,
+			Raw:                   string(raw),
+			Reasoning:             extractReasoning(string(raw)),
+			UpstreamModel:         reported,
+			ModelIdentityVerified: mc.RequireModelIdentity,
+			GenerationAttempts:    generationAttempts,
+			ProxyID:               picked.ID,
+			ProxyName:             picked.Name,
+			AccountID:             cookieID,
+			AccountLabel:          cookieLabel,
+			TTFBMs:                ttfb,
+			TotalMs:               time.Since(t0).Milliseconds(),
 		}
 		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
 		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。
@@ -956,7 +996,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 				cookieStr, sapisid, xsrfToken, proxyURL, mime, authUser)
 			result.ConvRCID = rcid
 			if aerr != nil {
-				logf("[media] 取回产物失败: %v", aerr)
+				logf("[media] 取回产物失败")
 				result.MediaErr = aerr
 			} else {
 				result.Artifacts = arts
@@ -1061,12 +1101,31 @@ func setAuthUserHeaders(h map[string]string, authuser int) {
 // 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
 func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
 	onLine func(string) error) (int, []byte, int64, []string, error) {
+	return doGeminiRequestContext(context.Background(), endpoint, body, headers, proxyURL, onLine)
+}
+
+func doGeminiRequestContext(parent context.Context, endpoint, body string, headers map[string]string, proxyURL string,
+	onLine func(string) error) (int, []byte, int64, []string, error) {
+	ctrl := startGenerationContext(parent, time.Duration(rtCfg().RequestTimeout)*time.Second)
+	defer ctrl.finish()
+	if parent.Err() != nil {
+		return 0, nil, 0, nil, parent.Err()
+	}
+	callback := func(line string) error {
+		if generationLineHasContent(line) {
+			ctrl.frame()
+		}
+		if onLine != nil {
+			return onLine(line)
+		}
+		return nil
+	}
 	sendAt := time.Now()
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
-		req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
+		req, err := http.NewRequestWithContext(ctrl.ctx, "POST", endpoint, strings.NewReader(body))
 		if err != nil {
-			return 0, nil, 0, nil, err
+			return 0, nil, 0, nil, ctrl.err(err)
 		}
 		applyChromeHeaders(req)
 		for k, v := range headers {
@@ -1075,20 +1134,20 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 		client := getStdlibClient(proxyURL)
 		resp, err := client.Do(req)
 		if err != nil {
-			return 0, nil, 0, nil, err
+			return 0, nil, 0, nil, ctrl.err(err)
 		}
 		defer resp.Body.Close()
-		raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
+		raw, ttfb, err := readBody(resp.Body, callback, sendAt)
 		if err != nil {
-			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
+			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), ctrl.err(err)
 		}
 		return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 	}
 
 	// 直连 → tls-client，保留 chrome146 TLS/HTTP2 真指纹
-	req, err := fhttp.NewRequest("POST", endpoint, strings.NewReader(body))
+	req, err := fhttp.NewRequestWithContext(ctrl.ctx, "POST", endpoint, strings.NewReader(body))
 	if err != nil {
-		return 0, nil, 0, nil, err
+		return 0, nil, 0, nil, ctrl.err(err)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -1096,12 +1155,12 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	client := getTLSClient()
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, 0, nil, err
+		return 0, nil, 0, nil, ctrl.err(err)
 	}
 	defer resp.Body.Close()
-	raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
+	raw, ttfb, err := readBody(resp.Body, callback, sendAt)
 	if err != nil {
-		return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
+		return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), ctrl.err(err)
 	}
 	return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 }

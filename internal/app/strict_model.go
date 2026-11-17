@@ -89,7 +89,7 @@ func pickAccountForModel(mc ModelConfig, exclude map[int64]bool) (*CookieAccount
 		skip[id] = true
 	}
 	var soonest time.Duration
-	if rtCfg().StrictModel && mc.Upstream != "" {
+	if (rtCfg().StrictModel || mc.RequireModelIdentity) && mc.Upstream != "" {
 		var cooling map[int64]bool
 		cooling, soonest = coolingAccounts(mc)
 		for id := range cooling {
@@ -191,7 +191,10 @@ func (e *ModelIdentityError) Error() string {
 	if e.Reported == "" {
 		return fmt.Sprintf("cannot verify requested %s: upstream did not report a model identity", e.Requested)
 	}
-	return fmt.Sprintf("requested %s but upstream reported %s; no output returned", e.Requested, e.Reported)
+	if safe := safeReportedModel(e.Reported); safe != "" {
+		return fmt.Sprintf("requested %s but upstream reported %s", e.Requested, safe)
+	}
+	return fmt.Sprintf("requested %s but upstream reported an unrecognized model", e.Requested)
 }
 
 func (e *ModelIdentityError) code() string {
@@ -240,26 +243,73 @@ func responseModelReports(raw string) []string {
 }
 
 // An explicit family check does not claim a verified thinking tier.
+func modelReportMatches(mc ModelConfig, reported string) bool {
+	want := strings.ToLower(mc.Upstream)
+	got := strings.Join(strings.Fields(strings.ToLower(reported)), " ")
+	switch got {
+	case want, want + " low", want + " medium", want + " high",
+		want + " thinking", want + " thinking high", want + " extended", want + " 扩展":
+		return true
+	}
+	return false
+}
+
 func verifyModelIdentity(mc ModelConfig, raw string) (string, error) {
 	if !mc.RequireModelIdentity {
 		return "", nil
 	}
-	want := strings.ToLower(mc.Upstream)
 	var reported string
 	for _, name := range responseModelReports(raw) {
 		reported = name
-		got := strings.Join(strings.Fields(strings.ToLower(reported)), " ")
-		switch got {
-		case want, want + " low", want + " medium", want + " high",
-			want + " thinking", want + " thinking high", want + " extended", want + " 扩展":
-		default:
-			return reported, &ModelIdentityError{Requested: mc.Upstream, Reported: reported}
+		if !modelReportMatches(mc, name) {
+			return name, &ModelIdentityError{Requested: mc.Upstream, Reported: name}
 		}
 	}
 	if reported == "" {
 		return "", &ModelIdentityError{Requested: mc.Upstream}
 	}
 	return reported, nil
+}
+
+// A bounded prefix waits for positive identity proof. If it overflows, hold
+// this result for normal complete-body extraction rather than leaking chunks.
+func guardedModelEmitter(mc ModelConfig, emit func(string) error) func(string) error {
+	if !mc.RequireModelIdentity {
+		return emit
+	}
+	const maxPending = 1 << 20
+	var pending []string
+	var size int
+	var confirmed, deferred bool
+	return func(line string) error {
+		reports := responseModelReports(line)
+		for _, name := range reports {
+			if !modelReportMatches(mc, name) {
+				return &ModelIdentityError{Requested: mc.Upstream, Reported: name}
+			}
+			confirmed = true
+		}
+		if deferred {
+			return nil
+		}
+		if !confirmed {
+			if size+len(line) > maxPending || len(pending) >= 256 {
+				pending = nil
+				deferred = true
+				return nil
+			}
+			pending = append(pending, line)
+			size += len(line)
+			return nil
+		}
+		for _, old := range pending {
+			if err := emit(old); err != nil {
+				return err
+			}
+		}
+		pending = nil
+		return emit(line)
+	}
 }
 
 func writeModelIdentityError(w http.ResponseWriter, e *ModelIdentityError) {
