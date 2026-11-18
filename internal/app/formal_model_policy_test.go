@@ -126,3 +126,24 @@ func TestFormalLogRequestedModelDropsUnexpectedSuffix(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// Upstream retirement wins over stale/per-account discovery data. In particular,
+// the dynamic catalog must not re-add a model omitted by availableModels.
+func TestRetiredModelNotReintroducedByDiscoveredCatalog(t *testing.T) {
+	withPoolCookie(t)
+	installCatalogFixture(t, func(*CookieAccount) AccountModelCatalog {
+		return AccountModelCatalog{Models: []DiscoveredModel{
+			{CanonicalName: "gemini-3.1-pro", HexID: hexPro31, Mode: 3, ThinkingPolicyKnown: true, ThinkingModes: []int{1, 2}},
+			{CanonicalName: "gemini-4-hydrogen", HexID: hexHydrogen4, Mode: 1},
+		}}
+	})
+	got := catalogModels(context.Background())
+	for _, name := range []string{"gemini-3.1-pro", "gemini-3.1-pro-thinking"} {
+		if _, ok := got[name]; ok {
+			t.Fatalf("retired model was advertised: %s", name)
+		}
+	}
+	if _, ok := got["gemini-4-hydrogen"]; !ok {
+		t.Fatal("active discovered model was omitted")
+	}
+}

@@ -169,7 +169,7 @@ func catalogModels(ctx context.Context) map[string]ModelConfig {
 				}
 				mu.Lock()
 				for name, mc := range Models {
-					if !mc.RequireModelIdentity || isLegacyFlashAlias(name) {
+					if mc.Retired != "" || !mc.RequireModelIdentity || isLegacyFlashAlias(name) {
 						continue
 					}
 					if _, ok := routeFromCatalog(cat, mc); ok {

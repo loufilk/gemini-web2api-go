@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Version = "4.28.1+chuanapi.models2.latency2"
+const Version = "4.29.0+chuanapi.models2.latency3"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)

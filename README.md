@@ -70,7 +70,7 @@
 | 出口 IP | 代理池：熔断、轮转，每个代理是独立限流槽 | 单个代理 | 单个代理 | —（走官方 API 额度） |
 | 静默降级 | `strict_model`：降级回答不算成功，换号重试，全池降级回 `429` | README 注明免费号请求 Pro 会落到 Flash | README 未提 | —（走官方 API 额度） |
 | 管理面板 | 内置 | README 未提 | README 未提 | 配套项目 CPAMC，另装 |
-| Gemini 4 Argon | 付费号 cookie 可用，含两档 thinking | README 未提 | 模型按账号动态发现，README 未点名 | 有，取决于渠道 |
+| Gemini 4 Carbon（原 4 Argon） | 付费号 cookie 可用 | README 未提 | 模型按账号动态发现，README 未点名 | 有，取决于渠道 |
 
 ## 功能
 
@@ -90,9 +90,9 @@
 
 **模型**
 - `gemini-3.6-flash`、`gemini-3.5-flash-lite` 匿名可用，含联网搜索
-- `gemini-3.1-pro` 挂 cookie 后可用，每次回答带思考链（`reasoning_content`）
-- `gemini-3.8-flash`、`gemini-4-hydrogen`、`gemini-4-argon` 要付费 / Ultra 账号的 cookie，且账号在网页端有相应模型权限
+- Hydrogen 需要登录且账号目录具有权限，免费号也可能可用；Carbon 需要相应付费权限。Argon 与 Carbon 独立核验，不互换型号。
 - 各模型都有 `-thinking` 版（扩展思考），挂 cookie 后可用
+- `gemini-3.1-pro` 上游已下线，请求直接返回 400 说明
 - 响应里记录服务端**实际**用了哪个模型，被静默降级一眼可见
 
 **不被拦 / 跑得久**
@@ -165,7 +165,7 @@ go build -o gemini-web2api-go .
 启动后会看到 banner：
 
 ```
-gemini-web2api-go v4.28.1
+gemini-web2api-go v4.29.0+chuanapi.models2.latency3
   Listening:   http://0.0.0.0:8083
   Base URL:    http://localhost:8083/v1
   API key:     sk-gemini-XX...XXXX  (mutable in admin UI)
@@ -253,7 +253,7 @@ Bifrost 等网关的 Google provider）：
 | `POST /v1/models/{model}:generateContent` 等 | 上面三个动作的 `/v1` 写法，同一套处理。`google-genai` 3.x 配自定义 `base_url` 时默认走 `/v1` |
 
 - **鉴权**：API key 放 `x-goog-api-key` 头或 `?key=` 参数（SDK 默认这么带），`Authorization: Bearer` 也认。
-- **模型名**用本项目的（`gemini-3.6-flash`、`gemini-3.1-pro` 等，见[模型](#模型)），不是官方 API 的 `gemini-2.5-flash` 那些。
+- **模型名**用本项目的（`gemini-3.6-flash`、`gemini-4-hydrogen` 等，见[模型](#模型)），不是官方 API 的 `gemini-2.5-flash` 那些。
 - **function calling**：`tools[].functionDeclarations`、`toolConfig.functionCallingConfig`（`AUTO` / `ANY` / `NONE`、
   `allowedFunctionNames`）、历史里的 `functionCall` / `functionResponse` 都认，模型的调用以 `functionCall` part 返回，
   SDK 的自动函数调用也能用。底下跟 OpenAI 接口是同一套 prompt 级实现，限制也一样（见[协议覆盖](#openai-协议覆盖)
@@ -337,15 +337,15 @@ Hydrogen 和 Carbon 是需要相应网页端权限的模型路由；有登录态
 
 | 模型 | 描述 |
 |---|---|
-| `gemini-3.6-flash` | 全方位，默认 |
+| `gemini-3.6-flash` | 默认。匿名时实际是 3.5 Flash-Lite，挂 cookie 后实际是 4 Hydrogen |
 | `gemini-3.5-flash-lite` | 极速、轻量 |
-| `gemini-3.1-pro` | 最强，**要配 cookie**；每次回答都带思考链 |
+| `gemini-3.1-pro` | 已下线，请求返回 400，不发送上游 |
 | `gemini-3.8-flash` | 兼容别名，指向 `gemini-4-hydrogen`；不在模型列表中展示 |
-| `gemini-4-hydrogen` | 4 Hydrogen 普通档，**要付费 Gemini 账号的 cookie，且账号在网页端可用 Hydrogen** |
+| `gemini-4-hydrogen` | 4 Hydrogen 普通档，**要登录 cookie，且账号在网页端可用 Hydrogen（免费号也可）** |
 | `gemini-4-carbon` | 独立候选路由，只有上游自报 4 Carbon 才成功 |
 | `gemini-3.6-flash-thinking` | 3.6 Flash 开扩展思考，**要配 cookie** |
 | `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite 开扩展思考，**要配 cookie** |
-| `gemini-3.1-pro-thinking` | 3.1 Pro 开扩展思考，**要配 cookie** |
+| `gemini-3.1-pro-thinking` | 已下线，请求返回 400 |
 | `gemini-3.8-flash-thinking` | 兼容别名，指向 `gemini-4-hydrogen-thinking` |
 | `gemini-4-hydrogen-thinking` | 请求扩展思考；校验 Hydrogen 系列，不证明实际思考档 |
 
@@ -354,19 +354,17 @@ Hydrogen 和 Carbon 是需要相应网页端权限的模型路由；有登录态
 | `gemini-canvas` | 画布，生成交互 HTML 文档（内联返回 ```html 块），**要配 cookie** |
 | `gemini-video` | 生视频（异步，几十秒~几分钟），产物 base64 MP4，**要 Pro/付费号**；免费号被上游内容政策拒 |
 
-这三条 4 系列路由和 3.1 Pro 不受 `strict_model` 开关影响。账号目录决定是否能选它，响应元数据决定是否成功；目录没有 Argon 的账号不会用 Carbon 冒充。流式内容等核对后再发，允许先保活，已开流后的错误用协议失败终态传递。见 [ChuanAPI 部署与回退说明](docs/chuanapi-model-rollout.md)。
+这三条 4 系列路由不受 `strict_model` 开关影响。账号目录决定是否能选它，响应元数据决定是否成功；目录没有 Argon 的账号不会用 Carbon 冒充。流式内容等核对后再发，允许先保活，已开流后的错误用协议失败终态传递。见 [ChuanAPI 部署与回退说明](docs/chuanapi-model-rollout.md)。
 
 > Hydrogen 路由依据：[上游 issue #74](https://github.com/zexadev/gemini-web2api-go/issues/74) 与 [gemini-stealth-bridge 的模型注册测试](https://github.com/azrinaldi/gemini-stealth-bridge/blob/ace32031a4ba9576d9f1d913c996e03d9bb6d087/internal/gemini/registry_names_test.go#L35)。这是社区网页协议证据，尚未在本机使用真实账号验证。
 
-没配 cookie 时 `/v1/models` 只返回前两个，选 `gemini-3.1-pro` 会直接报错并说明
-原因。因为匿名请求它必然被静默降级成 3.5 Flash-Lite——与其让客户端拿到一个
-"成功但其实不是 Pro"的回复，不如在选型时就失败。
-
-配了有效 cookie 时它是**真的 Pro**：连打 6 次服务端回报的都是 `3.1 Pro` 本身。
+没配 cookie 时 `/v1/models` 只返回 `gemini-3.6-flash` 和 `gemini-3.5-flash-lite`，选要登录的模型会直接报错并说明
+原因。因为匿名请求它们必然被静默降级成 3.5 Flash-Lite——与其让客户端拿到一个
+"成功但其实不是那个模型"的回复，不如在选型时就失败。
 
 `-thinking` 是网页 UI 上「扩展思考」的开关，跟模型正交——每个模型都能开，
-不是额外的模型。服务端回报的名字会带 `High`（如 `3.1 Pro High`，上游早期叫 `Extended`），
-思考链明显变长（3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 实测 2467 / 1059 / 583 字符，对应普通版 0 / 0 / 268）。
+不是额外的模型。服务端回报的名字会带 `High`（如 `4 Hydrogen High`，上游早期叫 `Extended`），
+思考链明显变长。
 **只在登录态生效**：匿名请求带上这个开关会被服务端静默忽略，所以没 cookie 时不暴露。
 
 旧的 `gemini-3.5-flash`、`gemini-3.5-flash-thinking`、
@@ -380,9 +378,9 @@ Hydrogen 和 Carbon 是需要相应网页端权限的模型路由；有登录态
 
 ### 思考链（reasoning_content）
 
-`gemini-3.1-pro` 每次回答前会先输出一段自己的推理过程，本项目把它按事实标准的
+开扩展思考的模型（如付费号上的 `gemini-4-hydrogen-thinking`）回答前会先输出一段自己的推理过程，本项目把它按事实标准的
 `reasoning_content` 字段暴露出来，newapi、Cherry Studio、ChatBox 等客户端会渲染成
-可折叠的「思考过程」。普通档的 3.6 Flash / 3.5 Flash-Lite 不产出思考链，此时不会出现这个字段。
+可折叠的「思考过程」。普通档不产出思考链，太简单的问题即使开了思考也可能没有，此时不会出现这个字段。
 
 非流式：
 
@@ -406,10 +404,10 @@ I've successfully defined..."
 
 ### 已知的能力边界
 
-匿名调用（不挂 cookie）只能拿到上面两个文本模型 + Gemini 自带的联网搜索。
-`gemini-3.1-pro` 匿名时被静默降级成 3.5 Flash-Lite，所以干脆不暴露。
+匿名调用（不挂 cookie）只能拿到 3.5 Flash-Lite + Gemini 自带的联网搜索。
+要登录的模型匿名时被静默降级成 3.5 Flash-Lite，所以干脆不暴露。
 
-挂上 cookie 额外解锁：`gemini-3.1-pro`、**扩展思考版（`-thinking`）**、**读图 / 读视频**、
+挂上 cookie 额外解锁：**4 Hydrogen**、**扩展思考版（`-thinking`）**、**读图 / 读视频**、
 **更长的上下文**（超长对话自动转成文本附件发，见下文），以及 **生图（`gemini-image`）**、
 **音乐（`gemini-music`）**、**画布（`gemini-canvas`）**、**生视频（`gemini-video`，要 Pro 号）**。
 
@@ -467,7 +465,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 自动删会话（`auto_delete_conversation`） | 默认关。开启后每次出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录账号里堆一堆。只登录态生效，异步 best-effort、删失败不影响响应。 |
 | 临时对话（`temporary_chat`） | 默认关。开启后走 Gemini 网页端原生「临时对话」：会话压根不进账号的会话列表、不用于模型训练，比「自动删会话」更干净，还省掉那次删除请求。只登录态有意义；开了「服务端多轮续接」时自动不生效（临时对话不留列表，多轮要靠服务端留会话）。 |
 | 生图下载原图/放大（`image_upscale`） | 默认关。开启后照网页「下载」按钮取生成的图：Ultra 号放大到宽高各 2 倍，普通号拿到未重新压缩的原始文件。每张图多一次请求；取不到就退回默认那张。见上文「生图 / 音乐」。 |
-| 匿名优先（`anon_first`） | 默认关。开启后不需要登录态能力的请求（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号。 |
+| 匿名优先（`anon_first`） | 默认关。开启后不需要登录态能力的请求（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 4 Hydrogen / 4 Carbon / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号。 |
 | 严格模型校验（`strict_model`） | 默认关。账号某一档额度用完时，上游不报错，而是静默换成更弱的模型照样回 200。开启后，服务端自报的模型跟请求的不一致就不把降级回答当成功：换下一个号重试，全池都被降级就回 `429 insufficient_quota`（`code: model_downgraded`，带 `Retry-After`）。流式在吐出第一个字之前就判断，不会先吐一半再报错。媒体模型（生图/音乐/视频/画布）不参与判断。 |
 | 降级冷却（`strict_model_cooldown_min`） | 配合严格模型校验：被降级的号在这个模型上歇多久再用，默认 300 分钟（网页端用量按 5 小时窗口算）。0 = 不记，每次请求都重新试。 |
 | 重试次数 / 重试间隔 / 上游超时 | |
@@ -480,7 +478,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 自动跟随 bl 版本（`gemini_bl_auto`） | 每 6 小时从 `/app` 页面抓一次最新版本号，抓不到或格式不对就用上面钉的值 |
 | 熔断冷却（`proxy_cooldown_min`） | 代理连续失败 5 次后歇多久再自动放回池子，默认 120 分钟（实测被拦的出口 106-121 分钟自恢复）。0 = 不自动恢复，要去代理池页手动重置 |
 | 无可用代理时退回直连（`fallback_direct`） | 默认关：代理全满或全熔断时直接报错，本机 IP 不暴露给上游。开：可用性优先，但上游会看到本机出口 |
-| cookie 失效时降级匿名（`fallback_anon`） | 默认关：直接报错，能立刻发现该换号了。开：继续跑，但 3.1 Pro 会被静默降级成 3.5 Flash-Lite、思考链消失 |
+| cookie 失效时降级匿名（`fallback_anon`） | 默认关：直接报错，能立刻发现该换号了。仅兼容非强制身份路由；Hydrogen/Carbon/Argon 不允许匿名降级成功，仍须账号目录与响应身份核验 |
 | 新协议（`web_channel`） | 默认关。开启后对话改走网页新版用的 processSession（WebChannel）接口，而不是老的 StreamGenerate。后端是同一个，只换传输方式；老接口目前仍正常，老接口出问题时再打开。文本、看图、生图、匿名都已实测；多轮续接仍走老接口；扩展思考在新协议上暂时不生效（回报普通档）。 |
 | 打印请求日志 | |
 
@@ -492,7 +490,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 项 | 说明 |
 |---|---|
 | API Key | 首次启动自动生成，面板里可轮换或自定义 |
-| Google Cookie | 面板「Cookie 池」页导入，保存即生效，可以导入多个账号。池里有账号后 `gemini-3.1-pro` 等要登录的模型才会出现在模型列表里 |
+| Google Cookie | 面板「Cookie 池」页导入，保存即生效，可以导入多个账号。Hydrogen/Carbon/Argon 仅在启用账号的已确认目录中可用时展示，添加 cookie 本身不保证可用 |
 
 两者都存在数据库里。已保存的值不回显（cookie 只显示识别到几个、关键项齐不齐）。
 
@@ -535,10 +533,10 @@ Cookie 池（按 URL、cookie 内容去重），之后一律从面板管理。�
 
 ## Cookie（可选）
 
-挂 Google 账号 cookie 后请求走登录态，多出来的能力是 **`gemini-3.1-pro` + 思考链**
+挂 Google 账号 cookie 后请求走登录态，多出来的能力是 **4 Hydrogen + 思考链**
 （见上文「思考链」一节）、**读图 / 读视频**、**生图（`gemini-image`）/ 音乐（`gemini-music`）
-/ 画布（`gemini-canvas`）/ 生视频（`gemini-video`，要 Pro 号）**。免费账号实测可用，
-连打 6 次全部回报 `3.1 Pro`。
+/ 画布（`gemini-canvas`）/ 生视频（`gemini-video`，要 Pro 号）**。免费账号实测
+请求 Flash 路由回报的就是 `4 Hydrogen`。
 
 深度研究（多步异步）仍**未实现**。
 
@@ -559,7 +557,7 @@ JSON 形式 `{"cookie": "SID=...; ...", "sapisid": "..."}` 也吃。带 `SAPISID
 算 `SAPISIDHASH` 授权头，所以这一项不能少。
 
 **cookie 只有「Cookie 池」这一个入口**：每个请求按最久未用优先挑一个 enabled 账号，
-挑中即推进轮转。池子里有 enabled 账号，`gemini-3.1-pro` 就会出现在模型列表里。
+挑中即推进轮转。Hydrogen/Carbon/Argon 仅在 enabled 账号的目录确认后展示；冷启动或目录发现失败时可能暂不显示。
 
 账号的「失败次数 / 最近成功」会随请求自动更新。判据是**只把确实是 cookie 的问题算作失败**：
 401/403、页面没有登录态、被跳到 Google 登录页。网络错误、超时、代理失败、被 Google 拦（跳 `/sorry`）
@@ -770,8 +768,9 @@ docker-compose.yml         单容器，默认拉 ghcr 镜像，sqlite 挂 volume
 | 偶发空响应、面板记为上游拒绝 | 上游瞬时拒绝（`1155`），没有可预测阈值，跟频率/并发/累积次数都无关 | 重发一次通常就好。**降 RPM 解决不了**，实测跟频率无关 |
 | 请求全部超时 | 本机到 `gemini.google.com` 不通 | 配代理（面板「代理池」或 `--proxy`）。注意**不读 `HTTPS_PROXY` 环境变量** |
 | 启动即退出，报 `unable to open database file (14)` | 容器以 nonroot(uid 65532) 运行，而 bind mount 的宿主目录属主是 root，写不进去 | 改用具名卷（compose 默认已是），或 `sudo chown -R 65532:65532 ./data` |
-| 选 `gemini-3.1-pro` 直接报错 | 没配 cookie 时它不暴露，这是故意的 | 在面板「Cookie 池」导入 cookie 后即可用 |
-| 挂了 cookie 后请求全部 502 | cookie 已失效，取不到 XSRF token | 重新导出 cookie。判据：请求 `gemini-3.1-pro` 若回报 3.5 Flash-Lite 就是失效了 |
+| 选 `gemini-4-hydrogen` 等直接报错 | 没配 cookie 时要登录的模型不暴露，这是故意的 | 在面板「Cookie 池」导入 cookie 后即可用 |
+| 选 `gemini-3.1-pro` 报 retired | 上游已下线 3.1 Pro | 换 `gemini-4-hydrogen` 或 `gemini-4-carbon` |
+| 挂了 cookie 后请求全部 502 | cookie 已失效，取不到 XSRF token | 重新导出 cookie。判据：请求 `gemini-4-hydrogen` 若回报 3.5 Flash-Lite 就是失效了 |
 | cookie 大约半小时就失效，保活没用 | Chrome 设备绑定会话，`__Secure-1PSIDTS` 换发 401 | 用 **Firefox** 重新登录再导出；点面板「保活」应能看到刷新了 `__Secure-1PSIDTS` |
 | 付费号的 cookie，付费模型却回报 3.5 Flash-Lite，「检测」显示登录态有效 | 浏览器里登了多个 Google 号，订阅不在默认号上，请求落到了默认号 | 在 Cookie 池给这条填「账号序号」（那个号的 Gemini 地址栏 `/u/1/` 就填 1），见上文 |
 | 面板打不开 / 401 | `--admin-token`（或 `ADMIN_TOKEN`）没对上 | token 留空将禁止管理访问，请设置 `ADMIN_TOKEN` |
@@ -807,8 +806,7 @@ Docker 用默认 bridge 网络时上游可能返回空内容（Google 拒绝某�
 ### 免费账号和 Pro / 付费账号差在哪？
 
 匿名（不挂 cookie）：`gemini-3.6-flash`、`gemini-3.5-flash-lite`，含联网搜索。
-挂免费账号 cookie：额外解锁 `gemini-3.1-pro`、3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 的思考版（`-thinking`）、读图 / 读视频、生图、音乐、画布。
-付费账号路由：`gemini-3.8-flash`、`gemini-4-hydrogen`、`gemini-4-argon`（及其 `-thinking`）和生视频（`gemini-video` / `/v1/videos`）。Hydrogen 还要求该账号在网页端可用该模型；添加 cookie 本身不保证已开通权限。
+挂免费账号 cookie：可使用目录确认的 Hydrogen、读图等登录功能。付费账号可额外具有 Carbon 和 Hydrogen High 权限，以实时目录及实际返回为准。3.1 Pro 已下线。
 
 ### 为什么每发一条消息，gemini.google.com 里就多出一个会话？
 
@@ -822,6 +820,8 @@ agent 工具一次塞几万字系统提示和历史时容易答非所问、看�
 Function calling 是 prompt 级实现，模型不一定每次都按格式返回。
 
 ### 旧 3.8 Flash、Hydrogen、Argon 和 Carbon 怎么选？
+
+本 fork 不采用上游 Argon/Carbon 互认。上游 mode 8 防挂起参数已合入，但它可能关闭思考档；思考后缀不保证 High，本次没有真实账号复测。
 
 旧 `gemini-3.7-flash` / `gemini-3.8-flash`（含 thinking）是 Hydrogen 的兼容别名；可以继续填写旧名，响应使用 Hydrogen 正名。若会员路由未切换、没有自报、或返回另一个型号，生成失败而不是改贴标签。Carbon 和 Argon 分别验身份；仅账户实时目录有独立 Argon 才会出现在可用列表。网页权限和实际思考档应单独验收。
 
